@@ -226,6 +226,7 @@ class UBatchWrapper:
             self.cudagraphs[num_tokens] = cudagraph_metadata
         return cudagraph_metadata.outputs
 
+    # 直接运行两个微批次 并合并结果 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
 
         @torch.inference_mode()
@@ -263,6 +264,7 @@ class UBatchWrapper:
         result = torch.cat(sorted_results, dim=0)
         return result
 
+    # Ubatch metadata creation 微批次元数据创建 用来支持微批次运行
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
                               positions, inputs_embeds, intermediate_tensors,
                               compute_stream, dp_metadata, batch_descriptor,
@@ -305,6 +307,7 @@ class UBatchWrapper:
 
         return ubatch_metadata
 
+    # 切片模型输入，用于微批次运行
     def _slice_model_inputs(self, tokens_slice: slice, input_ids, positions,
                             inputs_embeds, intermediate_tensors):
         sliced_input_ids = input_ids[tokens_slice]
@@ -363,6 +366,7 @@ class UBatchWrapper:
         # We shouldn't be here unless we are running with multiple DP ranks
         assert dp_metadata is not None
 
+        # Decide whether to capture/replay/run ubatches
         if num_tokens not in self.cudagraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             ubatch_metadata = self._make_ubatch_metadata(
@@ -377,10 +381,12 @@ class UBatchWrapper:
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE)
             with self.sm_control:
+                # Capture the cudagraph for the ubatches
                 return self._capture_ubatches(ubatch_metadata, self.model)
         elif num_tokens in self.cudagraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             cudagraph_metadata = self.cudagraphs[num_tokens]
+            # Replay the captured cudagraph
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:
@@ -396,4 +402,5 @@ class UBatchWrapper:
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE)
             with self.sm_control:
+                # Run the ubatches normally
                 return self._run_ubatches(ubatch_metadata, self.model)

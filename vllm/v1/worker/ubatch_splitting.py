@@ -106,6 +106,7 @@ def get_dp_padding_ubatch(
                                             dtype=torch.int32)
     return should_ubatch, num_tokens_after_padding
 
+# UBatch slice creation 具体逻辑，用于将完整批次划分为两个微批次
 def create_ubatch_slices(num_scheduled_tokens: np.ndarray, split_point: int) \
     -> UBatchSlices:
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
@@ -129,6 +130,8 @@ def create_ubatch_slices(num_scheduled_tokens: np.ndarray, split_point: int) \
     second_ubatch_req_slice = slice(second_ubatch_req_start,
                                     len(cu_num_tokens) - 1)
 
+    # Return the two ubatch slices
+    # 一个微批次切片包含请求切片和对应的令牌切片
     return [
         UBatchSlice(first_ubatch_req_slice, first_ubatch_token_slice),
         UBatchSlice(second_ubatch_req_slice, second_ubatch_token_slice)

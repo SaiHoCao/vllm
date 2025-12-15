@@ -9,7 +9,17 @@ def create_parser():
     parser = FlexibleArgumentParser()
     # Add engine args
     EngineArgs.add_cli_args(parser)
-    parser.set_defaults(model="meta-llama/Llama-3.2-1B-Instruct")
+    cudagraph_sizes = [1, 2, 4, 8, 16] + [i * 32 for i in range(1,17)]  # [32, 64, ..., 512]
+
+    
+    compilation_config = {"level": "0",
+                        "cudagraph_mode": "FULL_DECODE_ONLY",
+                      "cudagraph_capture_sizes": cudagraph_sizes,
+                      "enable_cudagraph_split": True}
+    parser.set_defaults(compilation_config=compilation_config)
+
+
+    parser.set_defaults(model="/home/csh/data/Qwen3-0.6B")
     # Add sampling params
     sampling_group = parser.add_argument_group("Sampling parameters")
     sampling_group.add_argument("--max-tokens", type=int)

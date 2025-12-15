@@ -350,6 +350,11 @@ class CompilationConfig:
     Map from layer name to layer objects that need to be accessed outside
     model code, e.g., Attention, FusedMOE when dp_size>1."""
 
+    # add a new config to enable split cudagraph 
+    enable_cudagraph_split: bool = False
+    # split parallel streams
+    enable_split_parallel_streams: bool = False
+
     # Attention ops; used for piecewise cudagraphs
     _attention_ops: ClassVar[list[str]] = [
         "vllm.unified_attention",

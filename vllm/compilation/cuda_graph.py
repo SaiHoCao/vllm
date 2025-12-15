@@ -118,6 +118,7 @@ class CUDAGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
+            # print(f"Running in eager. num_tokens: {0 if batch_descriptor is None else batch_descriptor.num_tokens}")
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_cudagraph_entries:
@@ -196,4 +197,5 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}")
 
         entry.cudagraph.replay()
+        # print(f"Running in CUDAGraph replayed. num_tokens: {batch_descriptor.num_tokens}")
         return entry.output
