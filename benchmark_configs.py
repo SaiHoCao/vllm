@@ -16,37 +16,34 @@ from pathlib import Path
 # 定义要测试的配置
 CONFIGS = {
     "baseline_no_cudagraph": {
-        "level": "0",
+        "level": "3",
         "cudagraph_mode": "NONE",
         "enable_cudagraph_split": False,
-        "enable_split_parallel_streams": False,
         "description": "Baseline: No CUDA Graph"
     },
     "cudagraph_no_split": {
-        "level": "0",
+        "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "enable_cudagraph_split": False,
-        "enable_split_parallel_streams": False,
         "description": "CUDA Graph: No Split (Padding)"
     },
-    "cudagraph_split_serial": {
-        "level": "0",
-        "cudagraph_mode": "FULL_DECODE_ONLY",
-        "enable_cudagraph_split": True,
-        "enable_split_parallel_streams": False,
-        "description": "CUDA Graph: Split Serial"
-    },
     "cudagraph_split_parallel": {
-        "level": "0",
+        "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "enable_cudagraph_split": True,
-        "enable_split_parallel_streams": True,
-        "description": "CUDA Graph: Split Parallel Streams"
+        "description": "CUDA Graph: Replay Parallel Eager Execution"
+    },
+    "cudagraph_dual_stream": {
+        "level": "3",
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "enable_cudagraph_split": True,
+        "enable_dual_graph": True,
+        "description": "CUDA Graph: Dual Stream Replay Execution"
     },
 }
 
 
-def generate_test_configs(min_batch: int = 1, max_batch: int = 512,
+def generate_test_configs(min_batch: int = 100, max_batch: int = 512,
                           min_seq: int = 1024, max_seq: int = 2048,
                           seed: int = 42) -> list[tuple[int, int]]:
     """
@@ -57,15 +54,10 @@ def generate_test_configs(min_batch: int = 1, max_batch: int = 512,
     random.seed(seed)
     
     batch_sizes = []
-    if min_batch <= 8:
-        batch_sizes.append(1)
-        batch_sizes.append(2)
-        batch_sizes.append(4)
-    
     start = max(8, min_batch if min_batch % 2 == 0 else min_batch + 1)
 
-    # 以步长 8 生成 batch sizes
-    for bs in range(start, max_batch + 1, 8):
+    # 以步长 32 生成 batch sizes
+    for bs in range(start, max_batch + 1, 32):
         batch_sizes.append(bs)
     
     if max_batch not in batch_sizes and max_batch >= min_batch:
@@ -107,9 +99,9 @@ def run_single_config(config_name: str, config: dict,
     compilation_config_str = json.dumps({
         "level": config["level"],
         "cudagraph_mode": config["cudagraph_mode"],
-        "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)], # 1 到 512
+        "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)], # 1 到 512 [1,2,4,8,16,32,64,128,192,256,320,384,448,512]
         "enable_cudagraph_split": config["enable_cudagraph_split"],
-        "enable_split_parallel_streams": config["enable_split_parallel_streams"],
+        "enable_dual_graph": config["enable_dual_graph"],
     })
     
     cmd = [
@@ -123,6 +115,7 @@ def run_single_config(config_name: str, config: dict,
         "--config-description", config["description"],
         "--dataset-path", dataset_path,
         "--max-tokens", str(max_tokens),
+        "--gpu-memory-utilization", "0.8",
     ]
     
     print(f"\n{'='*70}")
@@ -144,7 +137,7 @@ def run_single_config(config_name: str, config: dict,
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Benchmark different CUDA Graph configurations")
-    parser.add_argument("--model", type=str, default="/home/csh/data/Qwen3-0.6B",
+    parser.add_argument("--model", type=str, default="/home/csh/data/Qwen3-4B",
                        help="Model path")
     parser.add_argument("--dataset-path", type=str, default="../../datasets/LongBench-v2",
                        help="Dataset path")
@@ -154,7 +147,7 @@ def main():
     parser.add_argument("--max-batch-size", type=int, default=512)
     parser.add_argument("--min-seq-len", type=int, default=1024)
     parser.add_argument("--max-seq-len", type=int, default=2048)
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--configs", type=str, nargs="+", 
                        choices=list(CONFIGS.keys()) + ["all"],

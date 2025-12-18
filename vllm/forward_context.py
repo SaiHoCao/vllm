@@ -9,12 +9,18 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
 import torch
 import torch.distributed as dist
+from enum import IntEnum
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatch_utils import UBatchSlices, is_second_ubatch_empty
+
+class StreamSlot(IntEnum):
+    """标识使用哪条流/内存池"""
+    PRIMARY = 0
+    SECONDARY = 1
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -280,6 +286,8 @@ class ForwardContext:
 
     ubatch_slices: Optional[UBatchSlices] = None
 
+    stream_slot: Optional[StreamSlot] = None  # 新增字段
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode in [
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL], \
@@ -304,7 +312,8 @@ def create_forward_context(
         dp_metadata: Optional[DPMetadata] = None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
-        ubatch_slices: Optional[UBatchSlices] = None):
+        ubatch_slices: Optional[UBatchSlices] = None,
+        stream_slot: Optional[StreamSlot] = None) -> ForwardContext:
     return ForwardContext(no_compile_layers=vllm_config.compilation_config.
                           static_forward_context,
                           virtual_engine=virtual_engine,
@@ -312,7 +321,8 @@ def create_forward_context(
                           dp_metadata=dp_metadata,
                           cudagraph_runtime_mode=cudagraph_runtime_mode,
                           batch_descriptor=batch_descriptor,
-                          ubatch_slices=ubatch_slices)
+                          ubatch_slices=ubatch_slices,
+                          stream_slot=stream_slot)
 
 
 @contextmanager
@@ -339,7 +349,8 @@ def set_forward_context(
         num_tokens_across_dp: Optional[torch.Tensor] = None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
-        ubatch_slices: Optional[UBatchSlices] = None):
+        ubatch_slices: Optional[UBatchSlices] = None,
+        stream_slot: Optional[StreamSlot] = StreamSlot.PRIMARY):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -359,7 +370,7 @@ def set_forward_context(
     forward_context = create_forward_context(attn_metadata, vllm_config,
                                              virtual_engine, dp_metadata,
                                              cudagraph_runtime_mode,
-                                             batch_descriptor, ubatch_slices)
+                                             batch_descriptor, ubatch_slices,stream_slot)
 
     try:
         with override_forward_context(forward_context):
