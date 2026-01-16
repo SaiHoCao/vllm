@@ -26,7 +26,7 @@ from vllm import version
 from vllm.config.cache import (BlockSize, CacheConfig, CacheDType, MambaDType,
                                PrefixCachingHashAlgo)
 from vllm.config.compilation import (CompilationConfig, CompilationLevel,
-                                     CUDAGraphMode, PassConfig)
+                                     CUDAGraphMode, PassConfig, ReplayMode)
 from vllm.config.device import Device, DeviceConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig

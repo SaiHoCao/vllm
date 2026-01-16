@@ -18,6 +18,8 @@ from tqdm import tqdm
 from typing_extensions import TypeAlias
 import dataclasses
 import torch.cuda.nvtx as nvtx
+import pynvml
+import os
 
 from enum import IntEnum
 
@@ -28,7 +30,7 @@ from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
+from vllm.config import (CompilationLevel, CUDAGraphMode, ReplayMode, VllmConfig,
                          get_layers_from_vllm_config, update_config)
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
@@ -38,7 +40,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
     prepare_communication_buffer_for_model)
 from vllm.forward_context import (BatchDescriptor, DPMetadata,
-                                  set_forward_context)
+                                  set_forward_context, create_forward_context)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -110,6 +112,10 @@ from vllm.v1.worker.ubatch_splitting import (check_ubatch_thresholds,
                                              ubatch_split)
 from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.gpu_ubatch_wrapper import UbatchMetadata
+from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+
+
 
 from .utils import (AttentionGroup, MultiModalBudget,
                     add_kv_sharing_layers_to_kv_cache_groups, bind_kv_cache,
@@ -348,13 +354,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._init_device_properties()
 
         # Persistent buffers for CUDA graphs.
+        # Cudagraph 需要的持久性buffer _make_buffer 创建CpuGpuBuffer 持续存在
+
+        # 1.输入相关的buffer
         self.input_ids = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int32)
+        # 输入序列的token_ids input_ids[i] 表示第i个token的token_id 对应词汇表中的索引
+
         self.positions = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int64)
+        # 输入序列的position_ids positions[i] 表示第i个token在序列中的位置索引
+
         self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
                                                  dtype=torch.int32)
+        # query_start_loc[i] 表示第i个请求的查询起始位置 累计和
+        # num_scheduled_tokens = [2, 5, 3]
+        # query_start_loc = [0, 2, 7, 10]
+
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # seq_lens[i] 表示第i个请求当前的输入序列长度 包括历史token 
+
+
+        # 2.多模态相关
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
@@ -362,17 +383,48 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                self.hidden_size,
                                                dtype=self.dtype,
                                                numpy=False)
+        # inputs_embeds[i] 表示第i个token对应的embedding向量 用于多模态
+
         self.is_token_ids = self._make_buffer(self.max_num_tokens,
                                               dtype=torch.bool)
+        # is_token_ids[i] 表示第i个输入是token_id还是embedding 
+        # 混合输入的时候进行区分 token_id or embedding
+
+        # 3.丢弃请求相关的buffer chunk prefill会丢弃一些请求
         self.discard_request_indices = self._make_buffer(self.max_num_reqs,
                                                          dtype=torch.int64)
+        # 记录在当前step中被丢弃的请求的索引 discard_request_indices[i] 表示第i个被丢弃的请求的索引
+        # chunck prefill的时候会丢弃一些请求
         self.num_discarded_requests = 0
 
+        # 4.推测解码相关的buffer
         self.num_decode_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                          dtype=torch.int32)
+        # num_decode_draft_tokens[i] 表示第i个请求在推测解码中解码的草稿token数量
+        
         self.num_accepted_tokens = self._make_buffer(self.max_num_reqs,
                                                      dtype=torch.int64)
+        # num_accepted_tokens[i] 表示第i个请求在推测解码中被接受的token数量
+        
 
+        # 定义micro graph 相关的buffer
+        self.micro_batch_size = 64
+        if self.compilation_config.replay_mode in (ReplayMode.DUAL_SERIAL, ReplayMode.DUAL_PARALLEL):
+            self.micro_input_ids = self._make_buffer(self.micro_batch_size,
+                                               dtype=torch.int32)
+            self.micro_positions = self._make_buffer(self.micro_batch_size,
+                                               dtype=torch.int64)
+            self.micro_inputs_embeds = self._make_buffer(self.micro_batch_size,
+                                                   self.hidden_size,
+                                                   dtype=self.dtype,
+                                                   numpy=False)
+            self.micro_is_token_ids = self._make_buffer(self.micro_batch_size,
+                                                  dtype=torch.bool)
+            
+            self.micro_query_start_loc = self._make_buffer(self.max_num_reqs + 1,
+                                                    dtype=torch.int32)
+            self.micro_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
@@ -447,13 +499,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device="cpu",
             pin_memory=self.pin_memory)
         
-        if self.compilation_config.enable_dual_graph or self.compilation_config.enable_cudagraph_split:
+        if self.compilation_config.replay_mode in (ReplayMode.DUAL_MIXED, ReplayMode.DUAL_PARALLEL):
             # 两条独立的流
             self.graph_streams: dict[StreamSlot, torch.cuda.Stream] = {
                 StreamSlot.PRIMARY: torch.cuda.Stream(),
                 StreamSlot.SECONDARY: torch.cuda.Stream(),
             }
 
+        # NVML for GPU memory profiling
+        self.pid = os.getpid()
+        pynvml.nvmlInit()
+            
+        self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    def _nvml_get_used_memory(self) -> int:
+        """Get the used GPU memory of the current process using NVML.
+
+        Returns:
+            The used GPU memory in bytes.
+        """
+        procs = pynvml.nvmlDeviceGetComputeRunningProcesses(self.handle)
+        for p in procs:
+            if p.pid == self.pid:
+                return p.usedGpuMemory
+        return 0
         
 
     def _make_buffer(self,
@@ -942,13 +1011,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         vllm_config: VllmConfig,
     ) -> bool:
         """
-        判断是否应该使用拆分策略：
-        - 当前 num_tokens 没有匹配的已捕获图
-        - 但存在一个更小的已捕获图可以复用
+        判断是否应该使用拆分策略
         """
 
         # DBO 不支持拆分
         if vllm_config.parallel_config.enable_dbo:
+            return False
+        
+        if vllm_config.compilation_config.replay_mode == ReplayMode.PADDING:
             return False
         
         # 仅在统一解码 纯decode 模式下拆分
@@ -958,15 +1028,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not hasattr(self, 'cudagraph_batch_sizes'):
             return False
         
-        # 检查是否有完全匹配的图
-        if num_input_tokens in self.cudagraph_batch_sizes:
-            return False  # 有匹配的图，不需要拆分
-        
-        # 检查是否有更小的可用图
-        available_sizes = [s for s in self.cudagraph_batch_sizes 
-                        if s < num_input_tokens]
-        if not available_sizes:
-            return False  # 没有可用的更小图
+        # 输入 token 数量小于等于 micro batch size，不拆分
+        if num_input_tokens <= self.micro_batch_size:
+            return False
         
         # 需要拆分
         return True
@@ -1108,28 +1172,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             (max_num_scheduled_tokens == self.uniform_decode_query_len) and \
             (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
         
-        if self.compilation_config.enable_cudagraph_split:
-            if self.vllm_config.parallel_config.enable_dbo:
-                raise ValueError("DBO and cudagraph splitting are mutually exclusive.")
-            
-            # 构建cudagraph拆分 所需要的ubatch_slices
-            split_for_cudagraph = self._should_split_for_cudagraph(
-                total_num_scheduled_tokens,uniform_decode,vllm_config=self.vllm_config)
-            
-            if split_for_cudagraph:
-                # print("[vLLM] Splitting ubatch for cudagraph reuse. "
-                #     f"Total tokens: {total_num_scheduled_tokens}, "
-                #     f"Available cudagraph sizes: {self.cudagraph_batch_sizes}")
-                # # 计算拆分点
-                split_point = self._get_split_point(total_num_scheduled_tokens)
-                # print(f"[vLLM] Using split point: {split_point} ")
-                # 构建拆分的 ubatch_slices
-                from vllm.v1.worker.ubatch_splitting import create_ubatch_slices
-                ubatch_slices = create_ubatch_slices(
-                    num_scheduled_tokens, split_point)
-                num_tokens_after_padding = None  # 不需要返回这个值
-            else:
-                ubatch_slices, num_tokens_after_padding = None, None
+        split_for_cudagraph = False
+        ubatch_slices = None
+        num_tokens_after_padding = None
+
+        # 构建 ubatch_slices 
+        # DBO 模式是对半切分 dual 模式是自己定义切分点
+        if self._should_split_for_cudagraph(
+            total_num_scheduled_tokens,uniform_decode,vllm_config=self.vllm_config):
+                # 构建cudagraph拆分 所需要的ubatch_slices
+            split_point = self._get_split_point(total_num_scheduled_tokens)
+            # 构建拆分的 ubatch_slices
+            from vllm.v1.worker.ubatch_splitting import create_ubatch_slices
+            ubatch_slices = create_ubatch_slices(
+                num_scheduled_tokens, split_point)
+            num_tokens_after_padding = None  # 不需要返回这个值
+            split_for_cudagraph = True
+            print(f"[vLLM] Created {ubatch_slices[0].token_slice.stop-ubatch_slices[0].token_slice.start} , {ubatch_slices[1].token_slice.stop-ubatch_slices[1].token_slice.start} ubatch_slices for cudagraph split.")
         else:
             ubatch_slices, num_tokens_after_padding = \
                 ubatch_split(num_scheduled_tokens,
@@ -1137,7 +1196,104 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_tokens_padded,
                             uniform_decode=uniform_decode,
                             vllm_config=self.vllm_config)
-            split_for_cudagraph = None # 未启用拆分功能   
+        # 如果启用了 cudagraph 拆分功能
+
+        # if self.compilation_config.enable_cudagraph_split:
+        #     if self.vllm_config.parallel_config.enable_dbo:
+        #         raise ValueError("DBO and cudagraph splitting are mutually exclusive.")
+            
+        #     # 构建cudagraph拆分 所需要的ubatch_slices 
+        #     split_for_cudagraph = self._should_split_for_cudagraph(
+        #         total_num_scheduled_tokens,uniform_decode,vllm_config=self.vllm_config)
+            
+        #     if split_for_cudagraph:
+        #         split_point = self._get_split_point(total_num_scheduled_tokens)
+        #         # 构建拆分的 ubatch_slices
+        #         from vllm.v1.worker.ubatch_splitting import create_ubatch_slices
+        #         ubatch_slices = create_ubatch_slices(
+        #             num_scheduled_tokens, split_point)
+        #         # print("[vLLM] Creating ubatch_slices for cudagraph split...")
+        #         # print(f"[vLLM] num_scheduled_tokens: {total_num_scheduled_tokens}")
+        #         #         #         num_tokens_after_padding = None  # 不需要返回这个值
+
+        #     else:
+        #         ubatch_slices, num_tokens_after_padding = None, None
+        # else:
+        #     ubatch_slices, num_tokens_after_padding = \
+        #         ubatch_split(num_scheduled_tokens,
+        #                     num_tokens_unpadded,
+        #                     num_tokens_padded,
+        #                     uniform_decode=uniform_decode,
+        #                     vllm_config=self.vllm_config)
+        #     split_for_cudagraph = None # 未启用拆分功能   
+
+        # 新增 准备第二块缓冲区的内容 在ubatch_slices不为空 使用双图 双缓冲区的情况下
+        if split_for_cudagraph and ubatch_slices is not None and \
+            self.compilation_config.replay_mode == (ReplayMode.DUAL_PARALLEL or ReplayMode.DUAL_SERIAL):
+
+            second_slice = ubatch_slices[1]
+            token_start = second_slice.token_slice.start
+            token_end = second_slice.token_slice.stop
+            second_num_tokens = token_end - token_start
+
+            # print(f"[vLLM] Preparing second micro-batch with {second_num_tokens} tokens for cudagraph split...")
+            
+            req_start = second_slice.request_slice.start
+            req_end = second_slice.request_slice.stop
+            second_num_reqs = req_end - req_start
+            
+            # 1️⃣ 填充 SECONDARY buffer 的 input_ids
+            # 注意:需要重新索引,不能直接切片
+            second_token_indices = token_indices[token_start:token_end]
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                torch.from_numpy(second_token_indices),
+                out=self.micro_input_ids.cpu[:second_num_tokens]
+            )
+
+            # 2️⃣ 填充 SECONDARY buffer 的 positions
+            # 关键:重新计算 positions,从每个请求的 num_computed_tokens 开始
+            second_req_indices = req_indices[token_start:token_end]
+            second_num_scheduled = num_scheduled_tokens[req_start:req_end]
+            _, second_arange = self._get_cumsum_and_arange(second_num_scheduled)
+            
+            second_positions_np = self.micro_positions.np[:second_num_tokens]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[second_req_indices],
+                second_arange,
+               out=second_positions_np
+            )
+
+            # 3️⃣ 填充 SECONDARY buffer 的 query_start_loc
+            second_cu_tokens, _ = self._get_cumsum_and_arange(second_num_scheduled)
+            self.micro_query_start_loc.np[0] = 0
+            self.micro_query_start_loc.np[1:second_num_reqs + 1] = second_cu_tokens
+            self.micro_query_start_loc.np[second_num_reqs + 1:].fill(
+                second_cu_tokens[-1] if len(second_cu_tokens) > 0 else 0)
+
+            # 4️⃣ 填充 SECONDARY buffer 的 seq_lens
+            self.micro_seq_lens.np[:second_num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[req_start:req_end] +
+                second_num_scheduled
+            )
+            self.micro_seq_lens.np[second_num_reqs:].fill(0)
+            # 5️⃣ 处理 prompt embeds (如果启用)
+            if self.enable_prompt_embeds:
+                second_is_token_ids = self.is_token_ids.cpu[token_start:token_end]
+                self.micro_is_token_ids.cpu[:second_num_tokens].copy_(
+                    second_is_token_ids)
+            
+            # 6️⃣ 将 SECONDARY buffer 数据拷贝到 GPU
+            self.micro_input_ids.copy_to_gpu(second_num_tokens)
+            self.micro_positions.copy_to_gpu(second_num_tokens)
+            self.micro_query_start_loc.copy_to_gpu()
+            self.micro_seq_lens.copy_to_gpu()
+            
+            if self.enable_prompt_embeds:
+                self.micro_is_token_ids.copy_to_gpu(second_num_tokens)
+
+        # Prepare seq_lens tensor.  
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
@@ -2038,25 +2194,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         # 确定输入的总token数，包括padding
-        if ubatch_slices and not split_for_cudagraph:
+        if ubatch_slices and self.parallel_config.enable_dbo: # DBO 下
             assert num_tokens_after_padding is not None
             num_input_tokens = int(num_tokens_after_padding[0].item() * 2)
             self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
-        elif ubatch_slices is None:
+        elif ubatch_slices is None: #正常cudagraph padding 模式下
             num_input_tokens = self._get_num_input_tokens(num_scheduled_tokens)
             num_pad, num_tokens_after_padding = self.get_dp_padding(
                 num_input_tokens)
             num_input_tokens += num_pad
-        else:
-            # split_for_cudagraph is True
+        elif self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL): # 双图Repaly 模式下
             # 双图模式下，输入token数等于 第一部分图的token数 + 第二部分图的token数
-            if self.compilation_config.enable_dual_graph:
-                first_part = self._get_split_point(num_scheduled_tokens)
-                second_unpadded = num_scheduled_tokens - first_part
-                second_part = self._get_num_input_tokens(second_unpadded)
-                num_input_tokens = first_part + second_part   
-            else:
-                num_input_tokens = num_scheduled_tokens
+            first_part = self._get_split_point(num_scheduled_tokens)
+            second_unpadded = num_scheduled_tokens - first_part
+            second_part = self._get_num_input_tokens(second_unpadded)
+            num_input_tokens = first_part + second_part
+
+            # TODO: 第二组只有micro batch 时
+            # 双图模式下 总的输入token数 = 第一部分图的token数 + 第二部分图的token数（micro batch slice）
+            # num_input_tokens = first_part + self.micro_batch_size
+            ## 这里mircobatch_size 逻辑有点问题
+
+            # 把第二部分的ubatch slice padding到 num_input_tokens
+            self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
+        else:
+            # Replay + eager Mixed 模式下
+            num_input_tokens = num_scheduled_tokens
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -2330,147 +2493,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._split_compute_stream = torch.cuda.Stream()
         return self._split_compute_stream
     
-    # 使用拆分策略执行cuda graph
-    def _execute_model_split_cudagraph(
-        self,
-        ubatch_slices: UBatchSlices,
-        attn_metadata: list[AttnMetadataDict],  # 已经准备好的两份 metadata
-        input_ids: Optional[torch.Tensor],
-        positions: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor],
-        intermediate_tensors: Optional[IntermediateTensors],
-        model_kwargs: dict[str, Any],
-        num_tokens_across_dp: Optional[torch.Tensor],
-        uniform_decode: bool,
-        scheduler_output: "SchedulerOutput",
-    ) -> torch.Tensor:
-        """
-        使用拆分策略执行模型：
-        - 第一部分 (split_point tokens): 使用已有 CUDA Graph 重放
-        - 第二部分 (剩余 tokens): Eager 模式运行
-        """
-
-        first_slice = ubatch_slices[0]
-        second_slice = ubatch_slices[1]
-        
-        first_num_tokens = first_slice.token_slice.stop - first_slice.token_slice.start
-        second_num_tokens = second_slice.token_slice.stop - second_slice.token_slice.start
-
-        # print(f"Executing model with split cudagraph:")
-        # print(f"First part tokens: {first_num_tokens}")
-        # print(f"Second part tokens: {second_num_tokens}")
-
-        # 初始化 kv_connector_output
-        kv_connector_output = None
-
-        # ========== 准备第一部分输入 ==========
-        first_batch_descriptor = BatchDescriptor(
-            num_tokens=first_num_tokens,
-            uniform_decode=uniform_decode
-        )
-        cudagraph_runtime_mode, first_batch_descriptor = \
-                self.cudagraph_dispatcher.dispatch(first_batch_descriptor)
-        
-        first_input_ids = input_ids[:first_num_tokens] if input_ids is not None else None
-        first_positions = positions[:first_num_tokens] if positions.ndim == 1 \
-                        else positions[:, :first_num_tokens]
-        first_inputs_embeds = inputs_embeds[:first_num_tokens] \
-                            if inputs_embeds is not None else None
-        first_intermediate = self._slice_intermediate_tensors(
-            intermediate_tensors, first_slice.token_slice) \
-            if intermediate_tensors else None
-
-        # ========== 准备第二部分输入 ==========
-        second_batch_descriptor = BatchDescriptor(
-            num_tokens=second_num_tokens,
-            uniform_decode=uniform_decode
-        )
-        
-        second_input_ids = input_ids[first_slice.token_slice.stop:] \
-                        if input_ids is not None else None
-        second_positions = positions[first_slice.token_slice.stop:] if positions.ndim == 1 \
-                        else positions[:, first_slice.token_slice.stop:]
-        second_inputs_embeds = inputs_embeds[first_slice.token_slice.stop:] \
-                            if inputs_embeds is not None else None
-        second_intermediate = self._slice_intermediate_tensors(
-            intermediate_tensors, second_slice.token_slice) \
-            if intermediate_tensors else None
-
-        
-        replay_stram = self.graph_streams[0]
-        eager_stream = self.graph_streams[1]
-        
-        # 用于同步的事件
-        first_done_event = torch.cuda.Event()
-        second_done_event = torch.cuda.Event()
-        
-        kv_connector_output = None
-        output_first = None
-        output_second = None
-        # ========== 双流并行执行两部分 ==========
-        
-        nvtx.range_push("Dual-Stream-Split-Execution")
-
-        print("Executing dual-stream split cudagraph...")
-        nvtx.range_push("Split-First-Part")
-        with torch.cuda.stream(replay_stram):
-            # ========== 在replay流上执行第一部分（CUDA Graph 重放） ==========
-            with (set_forward_context(
-                    attn_metadata[0],  # 第一份 attn_metadata
-                    self.vllm_config,
-                    num_tokens=first_num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=first_batch_descriptor,
-                    ubatch_slices=None,
-            ), record_function_or_nullcontext("Forward-Split-Graph-Parallel"),
-            self.maybe_get_kv_connector_output(scheduler_output) as
-            kv_connector_output):
-                output_first = self.model(
-                    input_ids=first_input_ids,
-                    positions=first_positions,
-                    intermediate_tensors=first_intermediate,
-                    inputs_embeds=first_inputs_embeds,
-                    **model_kwargs,
-                )
-            first_done_event.record(replay_stram)
-            nvtx.range_pop()  # Split-First-Part
-        
-
-        nvtx.range_push("Split-Second-Part")
-        # ========== 在第二条流上执行第二部分（Eager 模式） ==========
-        with torch.cuda.stream(eager_stream):
-            
-            with (set_forward_context(
-                    attn_metadata[1],  # 第二份 attn_metadata
-                    self.vllm_config,
-                    num_tokens=second_num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                    batch_descriptor=second_batch_descriptor,
-                    ubatch_slices=None,
-            ), record_function_or_nullcontext("Forward-Split-Eager-Parallel")):
-                output_second = self.model(
-                    input_ids=second_input_ids,
-                    positions=second_positions,
-                    intermediate_tensors=second_intermediate,
-                    inputs_embeds=second_inputs_embeds,
-                    **model_kwargs,
-                )
-            second_done_event.record(eager_stream)
-        
-        nvtx.range_pop()  # Split-Second-Part
-        nvtx.range_pop()  # Dual-Stream-Split-Execution
-        # ========== 同步两条流 ==========
-        # 在合并结果前，确保两部分都执行完成
-        first_done_event.synchronize()
-        second_done_event.synchronize()
-         
-        # ========== 合并结果 ==========
-        merged_output = self._merge_model_outputs(output_first, output_second)
-
-        return merged_output, kv_connector_output
-
     def _slice_intermediate_tensors(
         self,
         intermediate_tensors: Optional[IntermediateTensors],
@@ -2503,9 +2525,351 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return tuple(merged)
         else:
             return (output_first, output_second)
+    
+    # Ubatch metadata creation 微批次元数据创建 用来支持微批次运行
+    def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
+                              positions, inputs_embeds, intermediate_tensors,
+                              compute_stream, dp_metadata, batch_descriptor,
+                              cudagraph_runtime_mode) -> list[UbatchMetadata]:
+
+        # Create one forward context per ubatch
+        forward_contexts = []
+        for i, ubatch_slice in enumerate(ubatch_slices):
+            forward_contexts.append(
+                create_forward_context(
+                    attn_metadata[i] if attn_metadata is not None else None,
+                    self.vllm_config,
+                    dp_metadata=dp_metadata,
+                    batch_descriptor=batch_descriptor[i],
+                    cudagraph_runtime_mode=cudagraph_runtime_mode))
+
+        ubatch_ctxs = make_ubatch_contexts(
+            num_micro_batches=len(ubatch_slices),
+            comm_stream=self.comm_stream,
+            compute_stream=compute_stream,
+            forward_contexts=forward_contexts,
+            ready_barrier=self.ready_barrier)
+
+        ubatch_metadata: list[UbatchMetadata] = []
+        for i, ubatch_slice in enumerate(ubatch_slices):
+            sliced_input_ids, sliced_positions, sliced_inputs_embeds, \
+            sliced_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slice.token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors)
+            ubatch_metadata.append(
+                UbatchMetadata(
+                    context=ubatch_ctxs[i],
+                    input_ids=sliced_input_ids,
+                    positions=sliced_positions,
+                    inputs_embeds=sliced_inputs_embeds,
+                    intermediate_tensors=sliced_intermediate_tensors,
+                    num_tokens=ubatch_slice.token_slice.stop -
+                    ubatch_slice.token_slice.start))
+
+        return ubatch_metadata
+
+    # 切片模型输入，用于微批次运行
+    def _slice_model_inputs(self, tokens_slice: slice, input_ids, positions,
+                            inputs_embeds, intermediate_tensors):
+        sliced_input_ids = input_ids[tokens_slice]
+        # if we are using mrope. Mrope adds an additional dimension to the
+        # positions tensor
+        if positions.ndim == 2:
+            sliced_positions = positions[:, tokens_slice]
+        else:
+            sliced_positions = positions[tokens_slice]
+        sliced_inputs_embeds = inputs_embeds[
+            tokens_slice] if inputs_embeds else None
+        sliced_intermediate_tensors = intermediate_tensors[
+            tokens_slice] if intermediate_tensors else None
+
+        return (sliced_input_ids, sliced_positions, sliced_inputs_embeds,
+                sliced_intermediate_tensors)
+
+
+    # 使用一套内存池 Replay + Eager 模式执行模型
+    def _execute_model_single_mixed(
+        self,
+        ubatch_slices: UBatchSlices,
+        attn_metadata: list[AttnMetadataDict],  # 已经准备好的两份 metadata
+        input_ids: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor],
+        intermediate_tensors: Optional[IntermediateTensors],
+        model_kwargs: dict[str, Any],
+        num_tokens_across_dp: Optional[torch.Tensor],
+        uniform_decode: bool,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor:
+        """
+        使用拆分策略执行模型：
+        - 第一部分 (split_point tokens): 使用已有 CUDA Graph 重放
+        - 第二部分 (剩余 tokens): Eager 模式运行
+        """
+        
+        # num_tokens 已经包含 padding 也就是num_input_tokens
+        first_num_tokens = ubatch_slices[0].num_tokens
+        second_num_tokens = ubatch_slices[1].num_tokens
+
+        # ========== 准备第一部分输入 ==========
+        first_batch_descriptor = BatchDescriptor(
+            num_tokens=first_num_tokens,
+            uniform_decode=uniform_decode
+        )
+        cudagraph_runtime_mode, first_batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(first_batch_descriptor)
+        
+        first_input_ids, first_positions, first_inputs_embeds, \
+            first_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[0].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors) 
+
+
+        # ========== 准备第二部分输入 ==========
+        second_batch_descriptor = BatchDescriptor(
+            num_tokens=second_num_tokens,
+            uniform_decode=uniform_decode
+        )
+        _, second_batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(second_batch_descriptor)
+        
+        second_input_ids, second_positions, second_inputs_embeds, \
+            second_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[1].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors)
+
+        
+        replay_stram = self.graph_streams[StreamSlot.PRIMARY]
+        eager_stream = self.graph_streams[StreamSlot.SECONDARY]
+        
+        # 用于同步的事件
+        first_done_event = torch.cuda.Event()
+        second_done_event = torch.cuda.Event()
+        
+        kv_connector_output = None
+        # output_first = None
+        # output_second = None
+        # ========== 双流并行执行两部分 ==========
+        
+        nvtx.range_push(f"Dual-Stream-Split-Execution with num_tokens {first_num_tokens} + {second_num_tokens}")
+        nvtx.range_push(f"Split-First-Part with CUDA Graph Replay with num_tokens {first_num_tokens} ")
+        with torch.cuda.stream(replay_stram):
+            # ========== 在replay流上执行第一部分（CUDA Graph 重放） ==========
+            with (set_forward_context(
+                    attn_metadata[0],  # 第一份 attn_metadata
+                    self.vllm_config,
+                    num_tokens=first_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=first_batch_descriptor,
+                    ubatch_slices=None,
+            ), record_function_or_nullcontext("Forward-Split-Graph-Parallel"),
+            self.maybe_get_kv_connector_output(scheduler_output) as
+            kv_connector_output):
+                output_first = self.model(
+                    input_ids=first_input_ids,
+                    positions=first_positions,
+                    intermediate_tensors=first_intermediate_tensors,
+                    inputs_embeds=first_inputs_embeds,
+                    **model_kwargs,
+                )
+            first_done_event.record(replay_stram)
+        nvtx.range_pop()  # Split-First-Part
         
 
+        nvtx.range_push(f"Split-Second-Part in Eager Mode with num_tokens {second_num_tokens} ")
+        # ========== 在第二条流上执行第二部分（Eager 模式） ==========
+        with torch.cuda.stream(eager_stream):
+            
+            with (set_forward_context(
+                    attn_metadata[1],  # 第二份 attn_metadata
+                    self.vllm_config,
+                    num_tokens=second_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    batch_descriptor=second_batch_descriptor,
+                    ubatch_slices=None,
+            ), record_function_or_nullcontext("Forward-Split-Eager-Parallel")):
+                output_second = self.model(
+                    input_ids=second_input_ids,
+                    positions=second_positions,
+                    intermediate_tensors=second_intermediate_tensors,
+                    inputs_embeds=second_inputs_embeds,
+                    **model_kwargs,
+                )
+            second_done_event.record(eager_stream)
+        
+        nvtx.range_pop()  # Split-Second-Part
+        nvtx.range_pop()  # Dual-Stream-Split-Execution
+        # ========== 同步两条流 ==========
+        # 在合并结果前，确保两部分都执行完成
+        first_done_event.synchronize()
+        second_done_event.synchronize()
+         
+        # ========== 合并结果 ==========
+        merged_output = self._merge_model_outputs(output_first, output_second)
+
+        # with torch.cuda.stream(self.graph_streams[StreamSlot.PRIMARY]):
+        #     self.graph_streams[StreamSlot.PRIMARY].wait_event(first_done_event)
+        #     self.graph_streams[StreamSlot.PRIMARY].wait_event(second_done_event)
+        #     merged_output = self._merge_model_outputs(output_first, output_second)
+
+
+        return merged_output, kv_connector_output
+
     def _execute_model_dual_cudagraph(
+        self,
+        ubatch_slices: UBatchSlices,
+        attn_metadata: AttnMetadataDict,
+        input_ids: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor],
+        intermediate_tensors: Optional[IntermediateTensors],
+        model_kwargs: dict[str, Any],
+        num_tokens_across_dp: Optional[torch.Tensor],
+        uniform_decode: bool,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor:
+        """
+        使用双流 CUDA Graph 执行模型。
+        """
+        # 输入的input_ids, positions, inputs_embeds 都是完整的张量,长度为num_input_tokens
+        
+        first_slice = ubatch_slices[0]
+        second_slice = ubatch_slices[1]
+        if intermediate_tensors is not None:
+            print("Intermediate tensors provided in dual cudagraph execution.")
+        
+        # 计算第一部分的 token 数 等于切片的长度 第二部分的切片已经扩充到num_input_tokens
+        first_num_tokens = first_slice.token_slice.stop - first_slice.token_slice.start
+        second_num_tokens = second_slice.token_slice.stop - second_slice.token_slice.start
+
+        # ========== 准备第一部分输入 ==========
+        first_batch_descriptor = BatchDescriptor(
+            num_tokens=first_num_tokens,
+            uniform_decode=uniform_decode
+        )
+        first_cudagraph_runtime_mode, first_batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(first_batch_descriptor)
+        
+        first_input_ids, first_positions, first_inputs_embeds, \
+            first_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[0].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors) 
+        
+        #========== 准备第二部分输入 ==========
+        second_batch_descriptor = BatchDescriptor(
+            num_tokens=second_num_tokens,
+            uniform_decode=uniform_decode
+        )
+        second_cudagraph_runtime_mode, second_batch_descriptor = \
+                self.cudagraph_dispatcher.dispatch(second_batch_descriptor)
+        
+        # 原来使用同一个输入张量的切片
+        # second_input_ids, second_positions, second_inputs_embeds, \
+        #     second_intermediate_tensors = \
+        #         self._slice_model_inputs(
+        #             ubatch_slices[1].token_slice, input_ids, positions,
+        #             inputs_embeds, intermediate_tensors)
+
+
+        second_input_ids = self.micro_input_ids.gpu[:second_num_tokens] if input_ids is not None else None
+
+        second_positions = self.micro_positions.gpu[:second_num_tokens] if positions.ndim == 1 \
+                        else self.micro_positions.gpu[:, :second_num_tokens]
+        
+        second_inputs_embeds = self.micro_inputs_embeds.gpu[:second_num_tokens] \
+                            if inputs_embeds is not None else None
+        
+        second_intermediate_tensors = intermediate_tensors[
+            ubatch_slices[1].tokens_slice] if intermediate_tensors else None
+        
+
+        # 在不同流上执行
+        primary_stream = self.graph_streams[StreamSlot.PRIMARY]
+        secondary_stream = self.graph_streams[StreamSlot.SECONDARY]
+        
+        first_done = torch.cuda.Event()
+        second_done = torch.cuda.Event()
+        
+        kv_connector_output = None
+        # output_first = None
+        # output_second = None
+
+        nvtx.range_push("Dual Stream Model Execution")
+        nvtx.range_push(f"Dual Stream: First Part num-tokens{first_num_tokens}")
+        # 第一部分在第一条流上执行
+        with torch.cuda.stream(primary_stream):
+            with (set_forward_context(
+                    attn_metadata[0],
+                    self.vllm_config,
+                    num_tokens=first_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=first_cudagraph_runtime_mode,
+                    batch_descriptor=first_batch_descriptor,
+                    stream_slot=StreamSlot.PRIMARY,
+                    ubatch_slices=None,
+            ), record_function_or_nullcontext("Forward-DualStream-Primary"),
+            self.maybe_get_kv_connector_output(scheduler_output) as
+            kv_connector_output):
+                output_first = self.model(
+                    input_ids=first_input_ids,
+                    positions=first_positions,
+                    intermediate_tensors=first_intermediate_tensors,
+                    inputs_embeds=first_inputs_embeds,
+                    **model_kwargs,
+                )
+            first_done.record(primary_stream)
+
+        nvtx.range_pop()
+        nvtx.range_push(f"Dual Stream: Second Part num-tokens{second_num_tokens}")
+        
+        # 第二部分在副流上执行
+        with torch.cuda.stream(secondary_stream):
+            with (set_forward_context(
+                    attn_metadata[1],
+                    self.vllm_config,
+                    num_tokens=second_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=second_cudagraph_runtime_mode,
+                    batch_descriptor=second_batch_descriptor,
+                    stream_slot=StreamSlot.SECONDARY,
+                    ubatch_slices=None,
+            ), record_function_or_nullcontext("Forward-DualStream-Secondary")):
+                output_second = self.model(
+                    input_ids=second_input_ids,
+                    positions=second_positions,
+                    intermediate_tensors=second_intermediate_tensors,
+                    inputs_embeds=second_inputs_embeds,
+                    **model_kwargs,
+                )
+            second_done.record(secondary_stream)
+        
+        nvtx.range_pop()
+        # 同步
+        first_done.synchronize()
+        second_done.synchronize()
+        # torch.cuda.current_stream().synchronize()
+        # 合并结果
+        merged_output = self._merge_model_outputs(output_first, output_second)
+        # with torch.cuda.stream(primary_stream):
+        #     primary_stream.wait_event(first_done)
+        #     primary_stream.wait_event(second_done)
+        #     merged_output = self._merge_model_outputs(output_first, output_second)
+
+        
+        nvtx.range_pop()
+        nvtx.range_pop()
+
+
+
+        return merged_output, kv_connector_output
+
+    def _execute_model_dual_cudagraph_serial(
         self,
         ubatch_slices: UBatchSlices,
         attn_metadata: AttnMetadataDict,
@@ -2525,119 +2889,162 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         first_slice = ubatch_slices[0]
         second_slice = ubatch_slices[1]
         
-        # 计算第一部分的 token 数 等于切片的长度
+        # 计算第一部分的 token 数 等于切片的长度 第二部分的切片已经扩充到num_input_tokens
         first_num_tokens = first_slice.token_slice.stop - first_slice.token_slice.start
-        
-        second_num_tokens_unpadd = second_slice.token_slice.stop - second_slice.token_slice.start
+        second_num_tokens = second_slice.token_slice.stop - second_slice.token_slice.start
 
-        # 计算第二部分的paddig 后的 token 数
-        second_num_tokens = self._get_num_input_tokens(second_num_tokens_unpadd)
-
-
+        # 测试在单流上串行执行
         # ========== 准备第一部分输入 ==========
         first_batch_descriptor = BatchDescriptor(
             num_tokens=first_num_tokens,
             uniform_decode=uniform_decode
         )
-        cudagraph_runtime_mode, first_batch_descriptor = \
+        first_cudagraph_runtime_mode, first_batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(first_batch_descriptor)
         
-        first_input_ids = input_ids[:first_num_tokens] if input_ids is not None else None
-        first_positions = positions[:first_num_tokens] if positions.ndim == 1 \
-                        else positions[:, :first_num_tokens]
-        first_inputs_embeds = inputs_embeds[:first_num_tokens] \
-                            if inputs_embeds is not None else None
-        first_intermediate = self._slice_intermediate_tensors(
-            intermediate_tensors, first_slice.token_slice) \
-            if intermediate_tensors else None
+        first_input_ids, first_positions, first_inputs_embeds, \
+            first_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[0].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors) 
 
-        # ========== 准备第二部分输入 ==========
+        kv_connector_output = None
+        output_first = None
+        output_second = None
+
+        # 串行执行测试
+        with (set_forward_context(
+                attn_metadata[0],
+                self.vllm_config,
+                num_tokens=first_num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=first_cudagraph_runtime_mode,
+                batch_descriptor=first_batch_descriptor,
+                stream_slot=StreamSlot.PRIMARY,
+                ubatch_slices=None,
+        ), record_function_or_nullcontext("Forward-DualStream-Primary"),
+        self.maybe_get_kv_connector_output(scheduler_output) as
+        kv_connector_output):
+            output_first = self.model(
+                input_ids=first_input_ids,
+                positions=first_positions,
+                intermediate_tensors=first_intermediate_tensors,
+                inputs_embeds=first_inputs_embeds,
+                **model_kwargs,
+            )
+
+         # ========== 准备第二部分输入 ==========
         second_batch_descriptor = BatchDescriptor(
             num_tokens=second_num_tokens,
             uniform_decode=uniform_decode
         )
-        cudagraph_runtime_mode, second_batch_descriptor = \
+        second_cudagraph_runtime_mode, second_batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(second_batch_descriptor)
         
-        second_input_ids = input_ids[first_slice.token_slice.stop:] \
-                        if input_ids is not None else None
-        second_positions = positions[first_slice.token_slice.stop:] if positions.ndim == 1 \
-                        else positions[:, first_slice.token_slice.stop:]
-        second_inputs_embeds = inputs_embeds[first_slice.token_slice.stop:] \
+        # 原来使用同一个输入张量的切片
+        # second_input_ids, second_positions, second_inputs_embeds, \
+        #     second_intermediate_tensors = \
+        #         self._slice_model_inputs(
+        #             ubatch_slices[1].token_slice, input_ids, positions,
+        #             inputs_embeds, intermediate_tensors)
+        
+        second_input_ids = self.micro_input_ids.gpu[:second_num_tokens] if input_ids is not None else None
+        second_positions = self.micro_positions.gpu[:second_num_tokens] if positions.ndim == 1 \
+                        else self.micro_positions.gpu[:, :second_num_tokens]
+        second_inputs_embeds = self.micro_inputs_embeds.gpu[:second_num_tokens] \
                             if inputs_embeds is not None else None
-        second_intermediate = self._slice_intermediate_tensors(
-            intermediate_tensors, second_slice.token_slice) \
-            if intermediate_tensors else None
+        second_intermediate_tensors = intermediate_tensors[
+            ubatch_slices[1].tokens_slice] if intermediate_tensors else None
 
-        # 在不同流上执行
-        primary_stream = self.graph_streams[StreamSlot.PRIMARY]
-        secondary_stream = self.graph_streams[StreamSlot.SECONDARY]
+        #  # 获取第二部分的元数据对象（由 split_attn_metadata 生成）
+        # # 这个对象里包含了正确的 seq_lens, block_tables 等，但位置可能不对
+        # meta_second = attn_metadata[1] 
         
-        first_done = torch.cuda.Event()
-        second_done = torch.cuda.Event()
+        # # 获取请求数量 (Request Dimension)
+        # # num_reqs_second = meta_second.num_reqs
+        # ubatch_slice_2 = ubatch_slices[1]
+        # second_num_tokens = ubatch_slice_2.token_slice.stop - ubatch_slice_2.token_slice.start
+        # num_reqs_second = ubatch_slice_2.request_slice.stop - ubatch_slice_2.request_slice.start
         
-        kv_connector_output = None
-        nvtx.range_push("Dual Stream Model Execution")
-        
-        
-        nvtx.range_push(f"Dual Stream: First Part num-tokens{first_num_tokens}")
-        # 第一部分在第一条流上执行
-        with torch.cuda.stream(primary_stream):
-            with (set_forward_context(
-                    attn_metadata[0],
-                    self.vllm_config,
-                    num_tokens=first_num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=first_batch_descriptor,
-                    stream_slot=StreamSlot.PRIMARY,
-                    ubatch_slices=None,
-            ), record_function_or_nullcontext("Forward-DualStream-Primary"),
-            self.maybe_get_kv_connector_output(scheduler_output) as
-            kv_connector_output):
-                output_first = self.model(
-                    input_ids=first_input_ids,
-                    positions=first_positions,
-                    intermediate_tensors=first_intermediate,
-                    inputs_embeds=first_inputs_embeds,
-                    **model_kwargs,
-                )
-            first_done.record(primary_stream)
+        # # =========================================================
+        # # [补齐缺失] 将元数据搬运到 Persistent Buffer 的头部 (Index 0)
+        # # =========================================================
 
-        nvtx.range_pop()
-        nvtx.range_push(f"Dual Stream: Second Part num-tokens{second_num_tokens}")
-        
-        # 第二部分在副流上执行
-        with torch.cuda.stream(secondary_stream):
-            with (set_forward_context(
-                    attn_metadata[1],
-                    self.vllm_config,
-                    num_tokens=second_num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=second_batch_descriptor,
-                    stream_slot=StreamSlot.SECONDARY,
-                    ubatch_slices=None,
-            ), record_function_or_nullcontext("Forward-DualStream-Secondary")):
-                output_second = self.model(
-                    input_ids=second_input_ids,
-                    positions=second_positions,
-                    intermediate_tensors=second_intermediate,
-                    inputs_embeds=second_inputs_embeds,
-                    **model_kwargs,
-                )
-            second_done.record(secondary_stream)
-        
-        nvtx.range_pop()
-        # 同步
-        first_done.synchronize()
-        second_done.synchronize()
+        # # 1. 搬运 Block Tables (KV Cache 映射表) [Critical]
+        # #如果不搬，第二批请求会读到第一批请求的 Cache 页，导致完全乱码
+        # if hasattr(self, 'block_tables') and self.block_tables is not None:
+        #     # meta_second.block_table_tensor 已经是切分好的 view 了，直接 copy 即可
+        #     self.block_tables[:num_reqs_second].copy_(
+        #         meta_second.block_table_tensor, 
+        #         non_blocking=True
+        #     )
 
+        # # 2. 搬运 Sequence Lengths [Critical]
+        # # 告诉 Attention 算子每个请求的实际长度
+        # if hasattr(self, 'seq_lens') and self.seq_lens is not None:
+        #     self.seq_lens.gpu[:num_reqs_second].copy_(
+        #         meta_second.seq_lens, 
+        #         non_blocking=True
+        #     )
+
+        # # 3. 搬运 Query Start Locs (cu_seqlens) [Critical]
+        # # 你的 _make_metadata_with_slice 已经计算好了归零后的 start_loc
+        # # 我们直接把它填入 buffer 头部
+        # if hasattr(self, 'query_start_loc') and self.query_start_loc is not None:
+        #     # 注意长度是 num_reqs + 1
+        #     self.query_start_loc.gpu[:num_reqs_second + 1].copy_(
+        #         meta_second.query_start_loc, 
+        #         non_blocking=True
+        #     )
+
+        # # 4. 搬运 Slot Mapping [Critical for PagedAttention]
+        # # 用于写入/读取 KV Cache 的具体的 slot id
+        # # 它是 Token 级别的 (维度和 input_ids 一样)
+        # if hasattr(self, 'slot_mapping') and self.slot_mapping is not None:
+        #     # meta_second.slot_mapping 也是切好的 token view
+        #     self.slot_mapping[:second_num_tokens].copy_(
+        #         meta_second.slot_mapping, 
+        #         non_blocking=True
+        #     )
+            
+        # # 5. [上一步已提到] 搬运 is_token_ids
+        # # 虽然不在 attn_metadata 里，但也别忘了
+        # if hasattr(self, 'is_token_ids') and self.is_token_ids is not None:
+        #     offset_token = first_slice.token_slice.stop
+        #     self.is_token_ids[:second_num_tokens].copy_(
+        #         self.is_token_ids[offset_token : offset_token + second_num_tokens],
+        #         non_blocking=True
+        #     )
+
+        # =========================================================
+
+        # 更新 context 中的 attn_metadata
+        # 注意：这里我们不需要替换 attn_metadata[1]，因为 context manager
+        # 会使用我们传入的 batch_descriptor 和 buffers。
+        # 但为了保险起见，某些 vLLM 版本在 set_forward_context 会用到传入的 metadata
+        # 只要上面的 copy_ 执行了，GPU 上的数据就是对的
+
+        with (set_forward_context(
+                attn_metadata[1],
+                self.vllm_config,
+                num_tokens=second_num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=second_cudagraph_runtime_mode,
+                batch_descriptor=second_batch_descriptor,
+                stream_slot=StreamSlot.SECONDARY,
+                ubatch_slices=None,
+        ), record_function_or_nullcontext("Forward-DualStream-Secondary")):
+            output_second = self.model(
+                input_ids=second_input_ids,
+                positions=second_positions,
+                intermediate_tensors=second_intermediate_tensors,
+                inputs_embeds=second_inputs_embeds,
+                **model_kwargs,
+            )
+        
         # 合并结果
         merged_output = self._merge_model_outputs(output_first, output_second)
         nvtx.range_pop()
-
-
         return merged_output, kv_connector_output
 
     @torch.inference_mode()
@@ -2646,6 +3053,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        show_mem_info = False  # 是否显示显存信息（调试用）
+        # ========== 新增：执行前重置峰值统计 ==========
+        if torch.cuda.is_available() and show_mem_info:
+            # torch.cuda.reset_peak_memory_stats()
+            # initial_allocated = torch.cuda.memory_allocated() / (1024**2)
+            # initial_reserved = torch.cuda.memory_reserved() / (1024**2)
+            initial_nvml_used = self._nvml_get_used_memory()>>20  # 转换为 MB
+
+    
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2690,41 +3106,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                uniform_decode=uniform_decode)
             cudagraph_runtime_mode, batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(batch_descriptor)
-        nvtx.range_push("Model Execution")
+        nvtx.range_push(f"Model Execution {num_input_tokens} num-input-tokens")
+
+        # ========== 新增：Preprocess 后的显存统计 ==========
+        if torch.cuda.is_available() and show_mem_info:
+            torch.cuda.synchronize()
+            # preprocess_allocated = torch.cuda.memory_allocated() / (1024**2)
+            # preprocess_reserved = torch.cuda.memory_reserved() / (1024**2)
+            # preprocess_peak = torch.cuda.max_memory_allocated() / (1024**2)
+            preprocess_nvml_used = self._nvml_get_used_memory()>>20  # 转换为 MB
+
+        if torch.cuda.is_available() and show_mem_info:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # before_exec_allocated = torch.cuda.memory_allocated() / (1024**2)
+            # before_exec_reserved = torch.cuda.memory_reserved() / (1024**2)
+            before_exec_nvml_used = self._nvml_get_used_memory()>>20  # 转换为 MB
+
         # 运行模型
-        # ========== 新增：拆分执行逻辑 ==========
-        if split_for_cudagraph and ubatch_slices is not None:
-            if self.compilation_config.enable_dual_graph :
-                # 使用双流 cudagraph 执行
-                # print("Using dual-stream cudagraph execution.")
-                model_output, kv_connector_output = self._execute_model_dual_cudagraph(
-                    ubatch_slices=ubatch_slices,
-                    attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    uniform_decode=uniform_decode,
-                    scheduler_output=scheduler_output,
-                )
-            else:
-                # 使用拆分策略：第一部分重放图，第二部分 eager
-                # print("Using split cudagraph execution.")
-                model_output, kv_connector_output = self._execute_model_split_cudagraph(
-                    ubatch_slices=ubatch_slices,
-                    attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    uniform_decode=uniform_decode,
-                    scheduler_output=scheduler_output,
-                )
-        else:
+        if not split_for_cudagraph:
+            ############ 原有单流 CUDA Graph 执行路径 ############
             # This is currently to get around the assert in the DPMetadata
             # where it wants `num_tokens_across_dp` to align with `num_tokens`
             if ubatch_slices is not None:
@@ -2750,7 +3151,91 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+        elif self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
+            model_output, kv_connector_output = self._execute_model_dual_cudagraph(
+                ubatch_slices=ubatch_slices,
+                attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                uniform_decode=uniform_decode,
+                scheduler_output=scheduler_output,
+            )
+        elif self.compilation_config.replay_mode == ReplayMode.DUAL_SERIAL:
+            model_output, kv_connector_output = self._execute_model_dual_cudagraph_serial(
+                ubatch_slices=ubatch_slices,
+                attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                uniform_decode=uniform_decode,
+                scheduler_output=scheduler_output,
+            )
+        elif self.compilation_config.replay_mode == ReplayMode.DUAL_MIXED:
+            model_output, kv_connector_output = self._execute_model_single_mixed(
+                ubatch_slices=ubatch_slices,
+                attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                num_tokens_across_dp=num_tokens_across_dp,
+                uniform_decode=uniform_decode,
+                scheduler_output=scheduler_output,
+            )
+            
         nvtx.range_pop()
+
+        # ========== 新增：执行后显存统计 ==========
+        if torch.cuda.is_available() and show_mem_info:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # after_exec_allocated = torch.cuda.memory_allocated() / (1024**2)
+            # after_exec_reserved = torch.cuda.memory_reserved() / (1024**2)
+            # peak_allocated = torch.cuda.max_memory_allocated() / (1024**2)
+            # peak_reserved = torch.cuda.max_memory_reserved() / (1024**2)
+            after_exec_nvml_used = self._nvml_get_used_memory()>>20  # 转换为 MB
+            # 打印详细的显存使用报告
+            print(f"\n{'='*80}")
+            print(f"GPU Memory Report - Batch: {num_input_tokens} tokens, "
+                f"Uniform Decode: {uniform_decode}")
+            print(f"{'='*80}")
+            print(f"Initial State:")
+            # print(f"  Allocated: {initial_allocated:.2f} MB")
+            # print(f"  Reserved:  {initial_reserved:.2f} MB")
+            print(f" NVML Used: {initial_nvml_used:.2f} MB")
+            print(f"\nAfter Preprocess:")
+            # print(f"  Allocated: {preprocess_allocated:.2f} MB "
+            #     f"(+{preprocess_allocated - initial_allocated:.2f} MB)")
+            # print(f"  Reserved:  {preprocess_reserved:.2f} MB "
+            #     f"(+{preprocess_reserved - initial_reserved:.2f} MB)")
+            # print(f"  Peak:      {preprocess_peak:.2f} MB")
+            print(f" NVML Used: {preprocess_nvml_used:.2f} MB "
+                f"(+{preprocess_nvml_used - initial_nvml_used:.2f} MB)")
+            print(f"\nBefore Model Execution:")
+            # print(f"  Allocated: {before_exec_allocated:.2f} MB")
+            # print(f"  Reserved:  {before_exec_reserved:.2f} MB")
+            print(f" NVML Used: {before_exec_nvml_used:.2f} MB")
+
+            print(f"\nAfter Model Execution:")
+            # print(f"  Allocated: {after_exec_allocated:.2f} MB "
+            #     f"(+{after_exec_allocated - before_exec_allocated:.2f} MB)")
+            # print(f"  Reserved:  {after_exec_reserved:.2f} MB "
+            #     f"(+{after_exec_reserved - before_exec_reserved:.2f} MB)")
+            print(f" NVML Used: {after_exec_nvml_used:.2f} MB "
+                f"(+{after_exec_nvml_used - before_exec_nvml_used:.2f} MB)")
+            print(f"\nPeak During Execution:")
+            # print(f"  Peak Allocated: {peak_allocated:.2f} MB")
+            # print(f"  Peak Reserved:  {peak_reserved:.2f} MB")
+            print(f"{'='*80}\n")
+
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3381,7 +3866,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode in {
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
         }
-        print(f"Dummy run on stream {torch.cuda.current_stream()} ")
+        # print(f"Dummy run on stream {torch.cuda.current_stream()} ")
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.
@@ -3464,6 +3949,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
+
+        # 根据 stream_slot 选择对应的 buffer
+        if stream_slot == StreamSlot.PRIMARY:
+            input_ids_buffer = self.input_ids
+            positions_buffer = self.positions
+            query_start_loc_buffer = self.query_start_loc
+            seq_lens_buffer = self.seq_lens
+            inputs_embeds_buffer = self.inputs_embeds
+            is_token_ids_buffer = self.is_token_ids
+        else:  # StreamSlot.SECONDARY
+            input_ids_buffer = self.micro_input_ids
+            positions_buffer = self.micro_positions
+            query_start_loc_buffer = self.micro_query_start_loc
+            seq_lens_buffer = self.micro_seq_lens
+            inputs_embeds_buffer = self.micro_inputs_embeds
+            is_token_ids_buffer = self.micro_is_token_ids
+
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             attn_metadata = {}
             if ubatch_slices is not None:
@@ -3476,23 +3978,46 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
             else:
                 seq_lens = max_query_len
-            self.seq_lens.np[:num_reqs] = seq_lens
-            self.seq_lens.np[num_reqs:] = 0
-            self.seq_lens.copy_to_gpu()
+            # self.seq_lens.np[:num_reqs] = seq_lens
+            # self.seq_lens.np[num_reqs:] = 0
+            # self.seq_lens.copy_to_gpu()
+            seq_lens_buffer.np[:num_reqs] = seq_lens
+            seq_lens_buffer.np[num_reqs:] = 0
+            seq_lens_buffer.copy_to_gpu()
+
 
             cum_num_tokens, _ = self._get_cumsum_and_arange(
                 num_scheduled_tokens)
-            self.query_start_loc.np[1:num_reqs + 1] = cum_num_tokens
-            self.query_start_loc.copy_to_gpu()
+            # self.query_start_loc.np[1:num_reqs + 1] = cum_num_tokens
+            # self.query_start_loc.copy_to_gpu()
+            query_start_loc_buffer.np[1:num_reqs + 1] = cum_num_tokens
+            query_start_loc_buffer.copy_to_gpu()
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                     self.kv_cache_config.kv_cache_groups):
+                # common_attn_metadata = CommonAttentionMetadata(
+                #     query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
+                #     query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
+                #                                                  1],
+                #     seq_lens=self.seq_lens.gpu[:num_reqs],
+                #     seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
+                #     num_computed_tokens_cpu=self.input_batch.
+                #     num_computed_tokens_cpu_tensor[:num_reqs],
+                #     num_reqs=num_reqs,
+                #     num_actual_tokens=num_tokens,
+                #     max_query_len=max_query_len,
+                #     max_seq_len=self.max_model_len,
+                #     block_table_tensor=self.input_batch.
+                #     block_table[kv_cache_group_id].get_device_tensor(num_reqs),
+                #     slot_mapping=self.input_batch.block_table[
+                #         kv_cache_group_id].slot_mapping.gpu[:num_tokens],
+                #     causal=True)
                 common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
-                    query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
+                    query_start_loc=query_start_loc_buffer.gpu[:num_reqs + 1],
+                    query_start_loc_cpu=query_start_loc_buffer.cpu[:num_reqs +
                                                                  1],
-                    seq_lens=self.seq_lens.gpu[:num_reqs],
-                    seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
+                    seq_lens=seq_lens_buffer.gpu[:num_reqs],
+                    seq_lens_cpu=seq_lens_buffer.cpu[:num_reqs],
                     num_computed_tokens_cpu=self.input_batch.
                     num_computed_tokens_cpu_tensor[:num_reqs],
                     num_reqs=num_reqs,
@@ -3504,6 +4029,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     slot_mapping=self.input_batch.block_table[
                         kv_cache_group_id].slot_mapping.gpu[:num_tokens],
                     causal=True)
+                
                 for attn_group in self.attn_groups[kv_cache_group_id]:
                     if ubatch_slices is not None:
                         common_attn_metadata_list = split_attn_metadata(
@@ -3531,17 +4057,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if (self.supports_mm_inputs
                     and not self.model_config.is_encoder_decoder):
                 input_ids = None
-                inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
+                # inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
+                inputs_embeds = inputs_embeds_buffer.gpu[:num_tokens]
                 model_kwargs = {
                     **model_kwargs,
                     **self._dummy_mm_kwargs(num_reqs),
                 }
             elif self.enable_prompt_embeds:
                 input_ids = None
-                inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
+                # inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
+                inputs_embeds = inputs_embeds_buffer.gpu[:num_tokens]
                 model_kwargs = self._init_model_kwargs(num_tokens)
             else:
-                input_ids = self.input_ids.gpu[:num_tokens]
+                # input_ids = self.input_ids.gpu[:num_tokens]
+                input_ids = input_ids_buffer.gpu[:num_tokens]
                 inputs_embeds = None
 
             if self.uses_mrope:
@@ -3852,6 +4381,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
+        torch.cuda.synchronize()
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
@@ -3882,7 +4412,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
 
                 compilation_cases = list(reversed(self.cudagraph_batch_sizes))
-                if self.compilation_config.enable_dual_graph:
+                if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL):
                     self._capture_cudagraphs_dual(
                         compilation_cases,
                         cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -3906,7 +4436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 compilation_cases_decode = list(
                     reversed(decode_cudagraph_batch_sizes))
                 
-                if self.compilation_config.enable_dual_graph:
+                if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL):
                     self._capture_cudagraphs_dual(
                         compilation_cases=compilation_cases_decode,
                         cudagraph_runtime_mode=CUDAGraphMode.FULL,
@@ -3924,6 +4454,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # after here.
         set_cudagraph_capturing_enabled(False)
 
+        torch.cuda.synchronize()
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         elapsed_time = end_time - start_time
@@ -3996,7 +4527,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ):
         """
         双流模式下的 CUDA Graph 捕获。
-        捕获两组相同 batch size 的图。
+        xxxx捕获两组相同 batch size 的图xxxxx(修改)。
+        第一组捕获全部的图，第二组捕获一张图也就是 self.mirco_batch_size 大小和以下的图。
         stream_slot 参数指定需要使用的pool。
         """
         assert cudagraph_runtime_mode != CUDAGraphMode.NONE and \
@@ -4036,15 +4568,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     skip_eplb=True,
                     remove_lora=False)
                 
-                self._dummy_run(
-                    num_tokens,
-                    stream_slot=StreamSlot.SECONDARY,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                    force_attention=force_attention,
-                    uniform_decode=uniform_decode,
-                    allow_microbatching=allow_microbatching,
-                    skip_eplb=True,
-                    remove_lora=False)
+                if num_tokens <= self.micro_batch_size:
+                    self._dummy_run(
+                        num_tokens,
+                        stream_slot=StreamSlot.SECONDARY,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        force_attention=force_attention,
+                        uniform_decode=uniform_decode,
+                        allow_microbatching=allow_microbatching,
+                        skip_eplb=True,
+                        remove_lora=False)
 
             # ========== 捕获阶段：在两个内存池上 ==========
 
@@ -4056,16 +4589,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,
                 remove_lora=False)
-
-            
-            self._dummy_run(
-                num_tokens,
-                stream_slot=StreamSlot.SECONDARY,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                uniform_decode=uniform_decode,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=True,
-                remove_lora=False)
+            if num_tokens <= self.micro_batch_size:
+                self._dummy_run(
+                    num_tokens,
+                    stream_slot=StreamSlot.SECONDARY,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    uniform_decode=uniform_decode,
+                    allow_microbatching=allow_microbatching,
+                    skip_eplb=True,
+                    remove_lora=False)
 
 
         self.maybe_remove_all_loras(self.lora_config)
@@ -4130,7 +4662,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.vllm_config,
                     self.device,
                     num_metadata_builders=1
-                    if not self.parallel_config.enable_dbo and not self.compilation_config.enable_cudagraph_split else 2,#tmp fix
+                    if not self.parallel_config.enable_dbo and self.compilation_config.replay_mode == ReplayMode.PADDING else 2,#tmp fix
                 )
 
                 attn_groups.append(attn_group)

@@ -12,7 +12,7 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, ReplayMode
 from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id)
 from vllm.forward_context import BatchDescriptor, get_forward_context
@@ -100,7 +100,7 @@ class CUDAGraphWrapper:
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry]\
                                                                         = {}
         
-        self.graph_pool_secondary = current_platform.get_global_graph_pool() if self.compilation_config.enable_dual_graph else None
+        self.graph_pool_secondary = current_platform.get_global_graph_pool() if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL,ReplayMode.DUAL_SERIAL) else None
         self.concrete_cudagraph_entries_secondary: dict[
                 BatchDescriptor, CUDAGraphEntry] = {} 
 
@@ -131,10 +131,14 @@ class CUDAGraphWrapper:
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
             # print(f"Running in eager. num_tokens: {0 if batch_descriptor is None else batch_descriptor.num_tokens}")
+
+            if batch_descriptor is not None and batch_descriptor in self.concrete_cudagraph_entries:
+                print(f"Eager on stream {torch.cuda.current_stream()} , num_tokens: {batch_descriptor.num_tokens}")
+
             return self.runnable(*args, **kwargs)
         
-        print(f"CUDAGraphWrapper called on stream_slot={stream_slot} "
-              f"for batch_descriptor={batch_descriptor}")
+        # print(f"CUDAGraphWrapper called on stream_slot={stream_slot} "
+        #       f"for batch_descriptor={batch_descriptor}")
         
         current_entries = self.concrete_cudagraph_entries if stream_slot == StreamSlot.PRIMARY \
             else self.concrete_cudagraph_entries_secondary
@@ -187,7 +191,7 @@ class CUDAGraphWrapper:
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
 
-                print(f"capture cudagraph on stream {torch.cuda.current_stream()},pool {current_graph_pool}, num_tokens: {batch_descriptor.num_tokens}")
+                # print(f"capture cudagraph on stream {torch.cuda.current_stream()},pool {current_graph_pool}, num_tokens: {batch_descriptor.num_tokens}")
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=current_graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
@@ -224,7 +228,7 @@ class CUDAGraphWrapper:
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
 
-        print(f"replaying cudagraph on stream {torch.cuda.current_stream()} ,num_tokens: {batch_descriptor.num_tokens}")
+        print(f"Replay on stream {torch.cuda.current_stream()} ,num_tokens: {batch_descriptor.num_tokens}")
         entry.cudagraph.replay()
         # print(f"Running in CUDAGraph replayed. num_tokens: {batch_descriptor.num_tokens}")
         return entry.output

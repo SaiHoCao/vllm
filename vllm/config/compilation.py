@@ -63,6 +63,14 @@ class CUDAGraphMode(enum.Enum):
 
     def separate_routine(self) -> bool:
         return isinstance(self.value, tuple)
+    
+class ReplayMode(enum.Enum):
+    """ Constants for the replay mode in CompilationConfig.
+    """
+    PADDING = 0
+    DUAL_SERIAL = 1
+    DUAL_PARALLEL = 2
+    DUAL_MIXED = 3
 
 
 @config
@@ -350,11 +358,20 @@ class CompilationConfig:
     Map from layer name to layer objects that need to be accessed outside
     model code, e.g., Attention, FusedMOE when dp_size>1."""
 
-    # add a new config to enable split cudagraph 可以拆分batchsize
-    enable_cudagraph_split: bool = False
+    # # add a new config to enable split cudagraph 可以拆分batchsize
+    # enable_cudagraph_split: bool = False
 
-    # double stream douuble pool for cudagraph split (Primary/Secondary) 允许双流执行双图
-    enable_dual_graph: bool = False
+    # # double stream douuble pool for cudagraph split (Primary/Secondary) 允许双流执行双图
+    # enable_dual_graph: bool = False
+
+    replay_mode: Optional[ReplayMode] = None
+    """The replay mode for dual graph cudagraph execution:
+    - PADDING: use padding to the max batch size for cudagraph execution.
+    - DUAL_SERIAL: use dual stream serial execution for cudagraph execution.
+    - DUAL_PARALLEL: use dual stream parallel execution for cudagraph execution.
+    - DUAL_MIXED: use dual stream replay and eager mixed execution for cudagraph execution.
+    """
+
 
     # Attention ops; used for piecewise cudagraphs
     _attention_ops: ClassVar[list[str]] = [
@@ -427,6 +444,16 @@ class CompilationConfig:
         """
         if isinstance(value, str):
             return CUDAGraphMode[value.upper()]
+        return value
+    
+    @field_validator("replay_mode", mode="before")
+    @classmethod
+    def validate_replay_mode_before(cls, value: Any) -> Any:
+        """
+        enable parse the `replay_mode` enum type from string
+        """
+        if isinstance(value, str):
+            return ReplayMode[value.upper()]
         return value
 
     def __post_init__(self) -> None:

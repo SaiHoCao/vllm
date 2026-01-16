@@ -221,3 +221,14 @@ ep_kernels_workspace/
 vllm/third_party/triton_kernels/
 benchmark_results/
 *.nsys-rep
+*.json.gz
+bench_serve_results/
+plot/
+profile_logs/
+split_profile/
+2_benchmark_decode_results/
+benchmark_decode_results/
+seq200token64nsys/
+ShareGPT_V3_unfiltered_cleaned_split.json
+decode_diff_results/
+0.6_decode_diff_results/

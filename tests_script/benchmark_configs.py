@@ -19,19 +19,15 @@ CONFIGS = {
         "level": "3",
         "cudagraph_mode": "NONE",
         "enable_cudagraph_split": False,
+        "enable_dual_graph": False,
         "description": "Baseline: No CUDA Graph"
     },
-    "cudagraph_no_split": {
+    "cudagraph_padding": {
         "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "enable_cudagraph_split": False,
-        "description": "CUDA Graph: No Split (Padding)"
-    },
-    "cudagraph_split_parallel": {
-        "level": "3",
-        "cudagraph_mode": "FULL_DECODE_ONLY",
-        "enable_cudagraph_split": True,
-        "description": "CUDA Graph: Replay Parallel Eager Execution"
+        "enable_dual_graph": False,
+        "description": "CUDA Graph: Padding"
     },
     "cudagraph_dual_stream": {
         "level": "3",
@@ -54,13 +50,12 @@ def generate_test_configs(min_batch: int = 100, max_batch: int = 512,
     random.seed(seed)
     
     batch_sizes = []
-    start = max(8, min_batch if min_batch % 2 == 0 else min_batch + 1)
 
     # 以步长 32 生成 batch sizes
-    for bs in range(start, max_batch + 1, 32):
+    for bs in range(min_batch, max_batch, 32):
         batch_sizes.append(bs)
     
-    if max_batch not in batch_sizes and max_batch >= min_batch:
+    if max_batch not in batch_sizes:
         batch_sizes.append(max_batch)
     
     batch_sizes = sorted(set(bs for bs in batch_sizes if min_batch <= bs <= max_batch))
@@ -68,7 +63,7 @@ def generate_test_configs(min_batch: int = 100, max_batch: int = 512,
     # 为每个 batch size 生成固定的 seq_len
     test_configs = []
     for batch_size in batch_sizes:
-        seq_len = random.randint(min_seq, max_seq)
+        seq_len = 200
         test_configs.append((batch_size, seq_len))
     
     return test_configs
@@ -89,7 +84,7 @@ def load_test_configs(filepath: str) -> list[tuple[int, int]]:
 
 def run_single_config(config_name: str, config: dict, 
                       test_configs_file: str, output_dir: str,
-                      model_path: str, max_tokens: int = 128,
+                      model_path: str, max_tokens: int = 64,
                       dataset_path: str = "../../datasets/LongBench-v2"):
     """运行单个配置的测试"""
     
@@ -105,7 +100,7 @@ def run_single_config(config_name: str, config: dict,
     })
     
     cmd = [
-        sys.executable, "split_test_single.py",
+        sys.executable, "tests_script/split_test_single.py",
         "--model", model_path,
         "--max-model-len", "8192",
         "--compilation-config", compilation_config_str,
@@ -143,7 +138,7 @@ def main():
                        help="Dataset path")
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
                        help="Output directory for results")
-    parser.add_argument("--min-batch-size", type=int, default=1)
+    parser.add_argument("--min-batch-size", type=int, default=40)
     parser.add_argument("--max-batch-size", type=int, default=512)
     parser.add_argument("--min-seq-len", type=int, default=1024)
     parser.add_argument("--max-seq-len", type=int, default=2048)

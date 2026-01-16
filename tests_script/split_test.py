@@ -4,6 +4,7 @@
 import random
 import time
 from typing import Optional
+import torch
 
 from datasets import load_from_disk
 from vllm import LLM, EngineArgs, SamplingParams
@@ -21,20 +22,24 @@ def create_parser():
         "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
-        "enable_cudagraph_split": True,
-        "enable_dual_graph": True,
+        # "replay_mode": "DUAL_MIXED",
+        "replay_mode": "DUAL_SERIAL",
+        # "replay_mode": "DUAL_PARALLEL",
+        # "replay_mode": "PADDING",
+
     }
     parser.set_defaults(compilation_config=compilation_config)
     parser.set_defaults(model="/home/csh/data/Qwen3-4B")
     parser.set_defaults(max_model_len=8192)  # 支持长序列
+
+    # --no-enable-chunked-prefill # 关闭分块预填充，简化测试逻辑
+    parser.set_defaults(enable_chunked_prefill=False)
     
     # Test parameters
     test_group = parser.add_argument_group("Test parameters")
     test_group.add_argument("--dataset-path", type=str, 
-                           default="../../datasets/LongBench-v2",
+                           default="/home/csh/data/projects/datasets/LongBench-v2",
                            help="Path to LongBench-v2 dataset")
-    test_group.add_argument("--num-tests", type=int, default=10,
-                           help="Number of test cases to run")
     test_group.add_argument("--min-batch-size", type=int, default=100,
                            help="Minimum batch size")
     test_group.add_argument("--max-batch-size", type=int, default=512,
@@ -43,7 +48,7 @@ def create_parser():
                            help="Minimum sequence length (tokens)")
     test_group.add_argument("--max-seq-len", type=int, default=2048,
                            help="Maximum sequence length (tokens)")
-    test_group.add_argument("--max-tokens", type=int, default=10,
+    test_group.add_argument("--max-tokens", type=int, default=16,
                            help="Maximum generation length")
     test_group.add_argument("--seed_r", type=int, default=42,
                            help="Random seed")
@@ -102,6 +107,7 @@ def prepare_prompts_from_dataset(dataset, batch_size: int,
     return prompts
 
 
+
 def run_test_case(llm: LLM, prompts: list[str], 
                   sampling_params: SamplingParams,
                   test_id: int, batch_size: int, 
@@ -118,15 +124,19 @@ def run_test_case(llm: LLM, prompts: list[str],
     
     # 记录开始时间
     start_time = time.perf_counter()
-    
+
     try:
+        torch.cuda.memory._record_memory_history()
+        
         outputs = llm.generate(prompts, sampling_params)
         end_time = time.perf_counter()
         
+        torch.cuda.memory._dump_snapshot("split_test_memory_snapshots")
         elapsed_time = end_time - start_time
         total_input_tokens = sum(len(o.prompt_token_ids) for o in outputs)
         total_output_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-        
+
+        torch.cuda.memory._record_memory_history(enabled=False)
         result = {
             "test_id": test_id,
             "batch_size": batch_size,
@@ -149,9 +159,9 @@ def run_test_case(llm: LLM, prompts: list[str],
         
         # 打印部分输出示例
         print(f"\n  Sample outputs:")
-        for i, output in enumerate(outputs[:2]):
-            generated_text = output.outputs[0].text[:100]
-            print(f"    [{i}] {generated_text}...")
+        for i, output in enumerate(outputs[:15]):
+            generated_text = output.outputs[0].text.strip().replace("\n", " ")
+            print(f"    [{i}] {generated_text}")
             
     except Exception as e:
         end_time = time.perf_counter()
@@ -177,7 +187,6 @@ def run_test_case(llm: LLM, prompts: list[str],
 def main(args: dict):
     # Pop test parameters
     dataset_path = args.pop("dataset_path")
-    num_tests = args.pop("num_tests")  # 这个参数将不再使用
     min_batch_size = args.pop("min_batch_size")
     max_batch_size = args.pop("max_batch_size")
     min_seq_len = args.pop("min_seq_len")
@@ -206,12 +215,14 @@ def main(args: dict):
     
     # Create LLM
     print("\nInitializing LLM...")
+
     llm = LLM(**args)
     
     # Create sampling params
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
         temperature=0.0,  # 使用贪心解码以保证可复现性
+        ignore_eos=True, # 不要因为遇到 EOS 而停止生成
     )
     
     # Generate test configurations: 全范围 batch size 测试
@@ -236,12 +247,12 @@ def main(args: dict):
     # batch_sizes = [bs for bs in batch_sizes if min_batch_size <= bs <= max_batch_size]
     # batch_sizes = sorted(set(batch_sizes))  # 去重并排序
 
-    batch_sizes = [336]  # 仅测试两个 batch size，快速验证功能
+    batch_sizes = [450]  # 仅测试两个 batch size，快速验证功能
     
     # 为每个 batch size 随机生成一个 seq_len
     for batch_size in batch_sizes:
         # seq_len = random.randint(min_seq_len, max_seq_len)
-        seq_len = 1536  # 固定 seq_len，快速验证功能
+        seq_len = 200  # 固定 seq_len，快速验证功能
         test_configs.append((batch_size, seq_len))
     
     print(f"\n{'='*70}")
@@ -260,6 +271,7 @@ def main(args: dict):
         for i, (bs, sl) in enumerate(test_configs[-5:]):
             print(f"  Test {len(test_configs) - 4 + i}: batch_size={bs}, seq_len={sl}")
     
+    # torch.cuda.memory._record_memory_history()
     # Run tests
     results = []
     for i, (batch_size, seq_len) in enumerate(test_configs):
@@ -280,6 +292,7 @@ def main(args: dict):
         )
         results.append(result)
     
+    # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
     # Summary
     print(f"\n{'='*70}")
     print("Test Summary")
@@ -302,6 +315,8 @@ def main(args: dict):
         print(f"\nFailed tests:")
         for r in failed:
             print(f"  Test {r['test_id']}: {r['error']}")
+
+    # torch.cuda.memory._record_memory_history(enabled=None)
     
     # Detailed results table
     print(f"\n{'='*70}")
