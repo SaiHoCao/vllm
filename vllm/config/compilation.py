@@ -358,12 +358,6 @@ class CompilationConfig:
     Map from layer name to layer objects that need to be accessed outside
     model code, e.g., Attention, FusedMOE when dp_size>1."""
 
-    # # add a new config to enable split cudagraph 可以拆分batchsize
-    # enable_cudagraph_split: bool = False
-
-    # # double stream douuble pool for cudagraph split (Primary/Secondary) 允许双流执行双图
-    # enable_dual_graph: bool = False
-
     replay_mode: Optional[ReplayMode] = None
     """The replay mode for dual graph cudagraph execution:
     - PADDING: use padding to the max batch size for cudagraph execution.
