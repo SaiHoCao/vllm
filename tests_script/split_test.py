@@ -23,8 +23,8 @@ def create_parser():
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
         # "replay_mode": "DUAL_MIXED",
-        "replay_mode": "DUAL_SERIAL",
-        # "replay_mode": "DUAL_PARALLEL",
+        # "replay_mode": "DUAL_SERIAL",
+        "replay_mode": "DUAL_PARALLEL",
         # "replay_mode": "PADDING",
 
     }
@@ -126,17 +126,14 @@ def run_test_case(llm: LLM, prompts: list[str],
     start_time = time.perf_counter()
 
     try:
-        torch.cuda.memory._record_memory_history()
-        
+
         outputs = llm.generate(prompts, sampling_params)
         end_time = time.perf_counter()
-        
-        torch.cuda.memory._dump_snapshot("split_test_memory_snapshots")
+    
         elapsed_time = end_time - start_time
         total_input_tokens = sum(len(o.prompt_token_ids) for o in outputs)
         total_output_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
 
-        torch.cuda.memory._record_memory_history(enabled=False)
         result = {
             "test_id": test_id,
             "batch_size": batch_size,

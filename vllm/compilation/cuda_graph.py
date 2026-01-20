@@ -100,7 +100,7 @@ class CUDAGraphWrapper:
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry]\
                                                                         = {}
         
-        self.graph_pool_secondary = current_platform.get_global_graph_pool() if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL,ReplayMode.DUAL_SERIAL) else None
+        self.graph_pool_secondary = current_platform.graph_pool_handle() if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL,ReplayMode.DUAL_SERIAL) else None
         self.concrete_cudagraph_entries_secondary: dict[
                 BatchDescriptor, CUDAGraphEntry] = {} 
 
@@ -145,6 +145,8 @@ class CUDAGraphWrapper:
         current_graph_pool = self.graph_pool if stream_slot == StreamSlot.PRIMARY \
             else self.graph_pool_secondary
         
+        print(f"id of pool1: {id(self.graph_pool)}, id of pool2: {id(self.graph_pool_secondary)}")
+        print(f"stream_slot={stream_slot}, current_graph_pool={current_graph_pool},current_entries size={len(current_entries)}")
 
         if batch_descriptor not in current_entries:
             # create a new entry for this batch descriptor
@@ -191,7 +193,7 @@ class CUDAGraphWrapper:
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
 
-                # print(f"capture cudagraph on stream {torch.cuda.current_stream()},pool {current_graph_pool}, num_tokens: {batch_descriptor.num_tokens}")
+                print(f"capture cudagraph on stream {torch.cuda.current_stream()},pool {current_graph_pool}, num_tokens: {batch_descriptor.num_tokens}")
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=current_graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
