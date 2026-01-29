@@ -48,7 +48,7 @@ def create_parser():
                            help="Minimum sequence length (tokens)")
     test_group.add_argument("--max-seq-len", type=int, default=2048,
                            help="Maximum sequence length (tokens)")
-    test_group.add_argument("--max-tokens", type=int, default=16,
+    test_group.add_argument("--max-tokens", type=int, default=128,
                            help="Maximum generation length")
     test_group.add_argument("--seed_r", type=int, default=42,
                            help="Random seed")
@@ -244,7 +244,7 @@ def main(args: dict):
     # batch_sizes = [bs for bs in batch_sizes if min_batch_size <= bs <= max_batch_size]
     # batch_sizes = sorted(set(batch_sizes))  # 去重并排序
 
-    batch_sizes = [450]  # 仅测试两个 batch size，快速验证功能
+    batch_sizes = [400]  # 仅测试两个 batch size，快速验证功能
     
     # 为每个 batch size 随机生成一个 seq_len
     for batch_size in batch_sizes:

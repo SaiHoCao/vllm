@@ -333,6 +333,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.vllm_config.model_config.logits_processors),
             is_pooling_model=self.is_pooling_model,
         )
+        if self.compilation_config.replay_mode in (ReplayMode.DUAL_SERIAL, ReplayMode.DUAL_PARALLEL):
+            self.micro_input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                # We need to use the encoder length for encoder-decoer
+                # because of KV cache for cross-attention.
+                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[self.cache_config.block_size],
+                is_spec_decode=bool(self.vllm_config.speculative_config),
+                logitsprocs=build_logitsprocs(
+                    self.vllm_config, self.device, self.pin_memory,
+                    self.is_pooling_model,
+                    self.vllm_config.model_config.logits_processors),
+                is_pooling_model=self.is_pooling_model,
+            )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.async_output_copy_stream = torch.cuda.Stream() if \
@@ -933,6 +951,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
+        # 为当前批次准备输入ID。
+        # 仔细处理可从先前引擎迭代中缓存的`prev_sampled_token_ids`，在这种情况下，需要将GPU上的那些令牌复制到input_ids中的相应插槽中。
 
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
@@ -1070,35 +1090,64 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ]
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # total_num_scheduled_tokens 表示当前批次被调度的token总数量 
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        # print(f"[ModelRunner] Preparing inputs for {num_reqs} requests, "
+        #       f"{total_num_scheduled_tokens} total scheduled tokens.")
+
         # OPTIMIZATION: Start copying the block table first.
+        # 优化：首先开始复制块表。
         # This way, we can overlap the copy with the following CPU operations.
+        # 这样，我们就能让复制操作与后续的CPU操作重叠进行。 commit_block_table 是从cpu复制到gpu
+        # block_table 记录了每个请求中所需要的block id 列表 [num_reqs, max_num_blocks_per_req]
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # self.micro_input_batch.block_table.commit_block_table(num_reqs)
+
         # Get the number of scheduled tokens for each request.
+        # 获取每个请求被调度的token数量
+
         req_ids = self.input_batch.req_ids
+        # 当前批次的请求ID列表
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        # 每个请求被调度的token数量列表 tokens[i] 表示第i个请求被调度的token数量 shaped: [num_reqs]
+
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
 
         # Get request indices.
+        # 获取请求索引
+        # E.g., num_scheduled_tokens: [2, 5, 3]
+        # 这里表示 有三个请求 分别被调度了2 5 3个token 总共10个token
+
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        # 在总的token数量维度上 每个token对应的请求索引 shaped: [total_num_scheduled_tokens]
         req_indices = np.repeat(self.arange_np[:num_reqs],
                                 num_scheduled_tokens)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # cu_num_tokens 累计的token数量 每一个请求的结束位置 shaped: [num_reqs]
         cu_num_tokens, arange = self._get_cumsum_and_arange(
             num_scheduled_tokens)
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
+        # 每个token的position_ids shaped: [total_num_scheduled_tokens]
+
+        # num_computed_tokens_cpu: 当前批次每个请求已经计算过的token数量列表 shaped: [num_reqs]
+        # E.g., [10,30,40] 表示第0个请求已经计算过10个token 第1个请求计算过30个token 第2个请求计算过40个token
+        
+        # 计算每个 Token 在其所属序列中的 绝对位置索引
+        # [0, 1, 0, 1, 2, 3, 4, 0, 1, 2] + [10,10,30,30,30,30,30,40,40,40]
+        # -> [10, 11, 30, 31, 32, 33, 34, 40, 41, 42]
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
+        
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1106,7 +1155,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._calc_mrope_positions(scheduler_output)
 
         # Get token indices.
+        # 获取token索引 
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # req_indices: [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        # max_model_len 是指模型的最大上下文长度 每个请求都有可能使用到完整的上下文长度 所以token索引的计算需要加上
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         token_indices = (positions_np +
@@ -1131,6 +1183,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
         # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
+        # 因为我们没有在InputBatch上预先分配一个巨大的prompt_embeds CPU张量，所以我们需要将提示嵌入填充到GpuModelRunner预先分配的prompt_embeds张量中预期的位置。        
         if self.input_batch.req_prompt_embeds:
             output_idx = 0
             for req_idx in range(num_reqs):
@@ -1167,19 +1220,47 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 output_idx += num_sched
 
+        # 计算 slot mapping 并提交
+        # slot mapping [num_scheduled_tokens] 表示每个token在kv_cache中的位置索引
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
 
+        # example:
+        # num_reqs = 3          请求数量
+        # num_scheduled_tokens = [2, 5, 3]   每个请求被调度的token数量 [num_reqs]
+        # total_num_scheduled_tokens = 10  总的被调度的token数量
+        # cu_num_tokens = [2, 7, 10]  累计的token数量 每一个请求的结束位置 [num_reqs]
+        # arange = [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]  每个token在对应请求中的位置索引 [total_num_scheduled_tokens]
+        # req_indices = [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]  每个token对应的请求索引 [total_num_scheduled_tokens]
+        # token_indices = [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]  每个token在全局token_ids_cpu中的位置索引 [total_num_scheduled_tokens]
+
+        # query_start_loc: [0, 2, 7, 10]  每个请求的起始位置索引 [num_reqs + 1]
+
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
+
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
+        # 注意：将query_start_loc填充为非递减的，因为像FlashAttention这样的内核需要如此
         self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
+        # 填充query_start_loc的剩余部分 非递减 
+        # 例如 num_reqs=3 则 query_start_loc.shape=[0,2,7,10,10,10,10,...],[max_num_reqs + 1]
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+
+        # micro 
+        # self.micro_query_start_loc.np[0] = 0
+        # self.micro_query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
+        # # Note: pad query_start_loc to be non-decreasing, as kernels
+        # # like FlashAttention requires that
+        # self.micro_query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
+        # self.micro_query_start_loc.copy_to_gpu()
+        # micro_query_start_loc = self.micro_query_start_loc.gpu[:num_reqs + 1]
+
+
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         num_tokens_padded = num_tokens_unpadded + self.get_local_padding(
@@ -1211,16 +1292,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_tokens_padded,
                             uniform_decode=uniform_decode,
                             vllm_config=self.vllm_config)
+        
+        # ubatch_slices 包括请求切片和token切片信息
+
+        # seq_lens
+        # computed_tokens + scheduled_tokens = 当前批次每个请求的总token数量 也就是seq_lens序列长度 已经计算过的token数量 + 本次调度的token数量
+        # E.g., [10,30,40] + [2,5,3] = [12,35,43]
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
         # Fill unused with 0 for full cuda graph mode.
+        # full cuda graph 模式下 填充未使用的部分为0
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
         seq_lens = self.seq_lens.gpu[:num_reqs]
+        # 最大序列长度
         max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
+
+        # # micro
+        # self.micro_seq_lens.np[:num_reqs] = (
+        #     self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+        #     num_scheduled_tokens)
+        # # Fill unused with 0 for full cuda graph mode.
+        # self.micro_seq_lens.np[num_reqs:].fill(0)
+        # self.micro_seq_lens.copy_to_gpu()
+        # micro_seq_lens = self.micro_seq_lens.gpu[:num_reqs]
+        # micro_max_seq_len = self.micro_seq_lens.np[:num_reqs].max().item()
+
+        # 记录各个请求的num_tokens 用于后续判断是否需要丢弃采样的token?
         num_tokens = [
             self.requests[r].num_tokens for r in self.input_batch.req_ids
         ]
@@ -1228,6 +1329,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
+        # 记录不应被采样的请求的索引，
+        # 以便我们在返回前可以清除已采样的标记
         discard_requests_mask = self.seq_lens.np[:num_reqs] < num_tokens_np
         discard_request_indices = np.nonzero(discard_requests_mask)[0]
         self.num_discarded_requests = len(discard_request_indices)
@@ -1237,6 +1340,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
 
         # Copy the tensors to the GPU.
+        # 将张量复制到GPU。
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
         if self.uses_mrope:
@@ -1341,6 +1445,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     scheduler_output.
                     num_common_prefix_blocks[kv_cache_group_id])
 
+            # 构造 common_attn_metadata common 是指所有 layer 共享的部分
+            # 都是根据第一套内存池来构建的(self.input_batch) 里面的 block_table slot_mapping 等等
+            # 后面的拆分会基于这个 common_attn_metadata 来拆分
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc_cpu,
@@ -1358,6 +1465,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 causal=True,
                 encoder_seq_lens=encoder_seq_lens,
             )
+            
+            # TODO 构建第二个 common_attn_metadata 用于 micro batch
+            # 要求第二个 micro_common_attn_metadata 根据 micro_input_batch 来构建 以及其他第一套内存池的部分
+            # micro_common_attn_metadata = CommonAttentionMetadata(
+            #     query_start_loc=query_start_loc,
+            #     query_start_loc_cpu=query_start_loc_cpu,
+            #     seq_lens=seq_lens,
+            #     seq_lens_cpu=seq_lens_cpu,
+            #     num_computed_tokens_cpu=num_computed_tokens_cpu,
+            #     num_reqs=num_reqs,
+            #     num_actual_tokens=total_num_scheduled_tokens,
+            #     max_query_len=max_num_scheduled_tokens,
+            #     max_seq_len=max_seq_len,
+            #     block_table_tensor=blk_table_tensor,
+            #     slot_mapping=slot_mapping,
+            #     logits_indices_padded=logits_indices_padded,
+            #     num_logits_indices=logits_indices.size(0),
+            #     causal=True,
+            #     encoder_seq_lens=encoder_seq_lens,
+            # )
 
             if (self.speculative_config
                     and spec_decode_common_attn_metadata is None):
@@ -1390,15 +1517,126 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         num_decode_draft_tokens.cpu[:num_reqs],
                     )
                 # 根据ubatch_slices拆分common_attn_metadata 构建每个子batch的attn_metadata
+                # ubatch_slices 是包含请求的切片和token的切片信息
+                # 现在 attn_metadata[0] 是在input_batch 的前半部分，attn_metadata[1] 是input_batch的后半部分
+                # TODO attn_metadata[1] 要放在micro_input_batch的数据里 并且是在前半部分 
                 if ubatch_slices is not None:
+                    # 根据 ubatch_slices 拆分 common_attn_metadata 返回的common_attn_metadata_list
+                    # 也就是每个子 batch 对应的 common_attn_metadata
+
+                    # 能不能在这里 将第二个common_attn_metadata 也就是
+                    # common_attn_metadata_list [1] 的地址信息都是用 第二套来构建呢
+                    # micro_common_attn_metadata 来构建
+                    # 这样好像不对 因为 ubatch_slices[1] 是后半部分 根据切片的后半部分来构建 
+                    # 即使使用 micro_common_attn_metadata 也是 micro common_attn_metadata 的后半部分
+                    # 跟要求不一样 
+                    # 如果要使用 micro_common_attn_metadata 来构建 第二个ubatch
+                    # 那么就得把 ubatch_slices[1] 的切片改到从0开始
+
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
+                    # 这里common_attn_metadata_list 跟 ubatch_slices 是一一对应的
+                    # common_attn_metadata_list[0] 是构建在 input_batch 的前半部分，对应 ubatch_slices[0]
+                    # common_attn_metadata_list[1] 是构建在 input_batch 的后半部分，对应 ubatch_slices[1]
+                    
+                    # 要求 attn_metadata[1] 是在 micro_input_batch 的前半部分
+                    # 有两个思路：
+                    # 1. 直接使用 common_attn_metadata_list[1] 来构建 attn_metadata[1]
+                    #  然后把里面的数据 复制到 micro_input_batch 所对应的位置 手动造一个 attn_metadata_i
+                    # 2. 使用 micro_common_attn_metadata 来构建 attn_metadata[1]
+                    #  但是要把 ubatch_slices[1] 的 token_slice req_slice 改成从下标0开始 数据没变
+                     
+
+
+                    # #首先把 ubatch_slices[1] 的 token_slice 改成从0开始
+                    # micro_token_slice = ubatch_slices[1].token_slice
+                    # micro_token_slice = slice(
+                    #     micro_token_slice.start - ubatch_slices[1].token_slice.start,
+                    #     micro_token_slice.stop - ubatch_slices[1].token_slice.start
+                    # )
+                    # ubatch_slices[1] = UBatchSlice(
+                    #     request_slice=ubatch_slices[1].request_slice,
+                    #     token_slice=micro_token_slice
+                    # )
+
+
                     for ubid, common_attn_metadata in enumerate(
                             common_attn_metadata_list):
+                        # attn_metadata[0] 是根据 common_attn_metadata_list[0] 构建的 是input_batch 的前半部分
+                        # attn_metadata[1] 是根据 common_attn_metadata_list[1] 构建的 是input_batch 的后半部分
+
+                        # 想要的是 在使用micro_input_batch 的数据 micro_common_attn_metadata 来构建 attn_metadata[1]
+                        # 但是是micro_common_attn_metadata 的前半部分
+                        
+                        # 这里有两种考虑：
+                        # 1. attn_metadata[1] 仍然使用 common_attn_metadata_list[1] 来构建 然后把里面的数据 复制到 micro_input_batch 构建的 micro_attn_metadata  里 还得是前半部分
+                        # 2. 直接使用 micro_common_attn_metadata 来构建 attn_metadata[1] 但是要把里面的数据变成后半部分 也就是把ubatch_slices[1]  改成从 0 开始
                         attn_metadata_i = (attn_group.get_metadata_builder(
                             ubatch_id=ubid).build(
                                 common_prefix_len=common_prefix_len,
                                 common_attn_metadata=common_attn_metadata))
+                        from vllm.v1.attention.backends.flash_attn import (
+                            FlashAttentionMetadata,
+                        )
+                        # 方案1：把 attn_metadata_i 里的数据 复制到 基于micro_input_batch 构建的 micro_attn_metadata 里
+                        if ubid == 1:
+                            print("Using micro_input_batch to build attn_metadata for ubatch 1")
+
+                            num_actual_tokens = attn_metadata_i.num_actual_tokens
+
+                            max_query_len = attn_metadata_i.max_query_len
+                            # query_start_loc 与地址有关 
+                            # 复制到micro缓冲区
+                            self.micro_query_start_loc.gpu[:common_attn_metadata.num_reqs + 1].copy_(
+                                attn_metadata_i.query_start_loc.cpu())
+                            query_start_loc = self.micro_query_start_loc.gpu[:common_attn_metadata.num_reqs + 1]
+
+                            max_seq_len = attn_metadata_i.max_seq_len
+                            # seq_lens 与地址有关
+                            # 复制到micro缓冲区
+                            self.micro_seq_lens.gpu[:common_attn_metadata.num_reqs].copy_(
+                                attn_metadata_i.seq_lens.cpu())
+                            seq_lens = self.micro_seq_lens.gpu[:common_attn_metadata.num_reqs]
+
+                            # block_table 与地址有关
+                            # 复制到micro缓冲区
+                            self.micro_input_batch.block_table[kv_cache_group_id].block_table.gpu[:common_attn_metadata.num_reqs].copy_(
+                                attn_metadata_i.block_table.cpu())
+                            block_table_tensor = self.micro_input_batch.block_table[kv_cache_group_id].get_device_tensor(common_attn_metadata.num_reqs)
+                            
+                            # slot_mapping 与地址有关
+                            # 复制到micro缓冲区
+                            self.micro_input_batch.block_table[kv_cache_group_id].slot_mapping.gpu[:common_attn_metadata.num_actual_tokens].copy_(
+                                attn_metadata_i.slot_mapping.cpu())
+                            slot_mapping = self.micro_input_batch.block_table[kv_cache_group_id].slot_mapping.gpu[:common_attn_metadata.num_actual_tokens]
+                            
+                            use_cascade = attn_metadata_i.use_cascade
+                            scheduler_metadata = attn_metadata_i.scheduler_metadata
+                            cu_prefix_query_lens = attn_metadata_i.cu_prefix_query_lens
+                            prefix_kv_lens = attn_metadata_i.prefix_kv_lens
+                            suffix_kv_lens = attn_metadata_i.suffix_kv_lens
+                            prefix_scheduler_metadata = attn_metadata_i.prefix_scheduler_metadata
+                            max_num_splits = attn_metadata_i.max_num_splits
+                            causal = attn_metadata_i.causal
+
+                            attn_metadata_i = FlashAttentionMetadata(
+                                num_actual_tokens=num_actual_tokens,
+                                max_query_len=max_query_len,
+                                query_start_loc=query_start_loc,
+                                max_seq_len=max_seq_len,
+                                seq_lens=seq_lens,
+                                block_table=block_table_tensor,
+                                slot_mapping=slot_mapping,
+                                use_cascade=use_cascade,
+                                common_prefix_len=common_prefix_len,
+                                scheduler_metadata=scheduler_metadata,
+                                cu_prefix_query_lens=cu_prefix_query_lens,
+                                prefix_kv_lens=prefix_kv_lens,
+                                suffix_kv_lens=suffix_kv_lens,
+                                prefix_scheduler_metadata=prefix_scheduler_metadata,
+                                max_num_splits=max_num_splits,
+                                causal=causal)
+                        
                         for layer_name in kv_cache_group_spec.layer_names:
                             assert type(attn_metadata) is list
                             attn_metadata[ubid][layer_name] = attn_metadata_i
@@ -2636,13 +2874,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         second_cudagraph_runtime_mode, second_batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(second_batch_descriptor)
-        
+
         # 原来使用同一个输入张量的切片 
-        # second_input_ids, second_positions, second_inputs_embeds, \
-        #     second_intermediate_tensors = \
-        #         self._slice_model_inputs(
-        #             ubatch_slices[1].token_slice, input_ids, positions,
-        #             inputs_embeds, intermediate_tensors)
+        second_input_ids_sliced, second_positions_sliced, second_inputs_embeds_sliced, \
+            second_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[1].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors)
+        
+        # 把第二部分的input复制到另一套持续性变量上
+        if second_input_ids_sliced is not None:
+            # 检验是否正确复制
+            # # copy 前
+            # print("Before Copy - second_input_ids_sliced:", second_input_ids_sliced)
+            # print("Before Copy - micro_input_ids.gpu slice:", self.micro_input_ids.gpu[:second_num_tokens])
+
+            self.micro_input_ids.gpu[:second_num_tokens].copy_(second_input_ids_sliced)
+
+            # # copy 后
+            # print("After Copy - micro_input_ids.gpu slice:", self.micro_input_ids.gpu[:second_num_tokens])
+
+        if second_positions_sliced is not None:
+            if positions.ndim == 1:
+                self.micro_positions.gpu[:second_num_tokens].copy_(second_positions_sliced)
+            else:
+                self.micro_positions.gpu[:, :second_num_tokens].copy_(second_positions_sliced)
+
+        if second_inputs_embeds_sliced is not None:
+            self.micro_inputs_embeds.gpu[:second_num_tokens].copy_(second_inputs_embeds_sliced)
 
         # 使用第二套持续性变量 的切片
         second_input_ids = self.micro_input_ids.gpu[:second_num_tokens] if input_ids is not None else None
@@ -2799,12 +3058,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         second_cudagraph_runtime_mode, second_batch_descriptor = \
                 self.cudagraph_dispatcher.dispatch(second_batch_descriptor)
         
-        # 原来使用同一个输入张量的切片
+        # # 原来使用同一个输入张量的切片
         # second_input_ids, second_positions, second_inputs_embeds, \
         #     second_intermediate_tensors = \
         #         self._slice_model_inputs(
         #             ubatch_slices[1].token_slice, input_ids, positions,
         #             inputs_embeds, intermediate_tensors)
+        # 原来使用同一个输入张量的切片 
+        second_input_ids_sliced, second_positions_sliced, second_inputs_embeds_sliced, \
+            second_intermediate_tensors = \
+                self._slice_model_inputs(
+                    ubatch_slices[1].token_slice, input_ids, positions,
+                    inputs_embeds, intermediate_tensors)
+
+        # 把第二部分的input复制到另一套持续性变量上
+        if second_input_ids_sliced is not None:
+            # 检验是否正确复制
+            # # copy 前
+            # print("Before Copy - second_input_ids_sliced:", second_input_ids_sliced)
+            # print("Before Copy - micro_input_ids.gpu slice:", self.micro_input_ids.gpu[:second_num_tokens])
+
+            self.micro_input_ids.gpu[:second_num_tokens].copy_(second_input_ids_sliced)
+
+            # # copy 后
+            # print("After Copy - micro_input_ids.gpu slice:", self.micro_input_ids.gpu[:second_num_tokens])
+
+        if second_positions_sliced is not None:
+            if positions.ndim == 1:
+                self.micro_positions.gpu[:second_num_tokens].copy_(second_positions_sliced)
+            else:
+                self.micro_positions.gpu[:, :second_num_tokens].copy_(second_positions_sliced)
+
+        if second_inputs_embeds_sliced is not None:
+            self.micro_inputs_embeds.gpu[:second_num_tokens].copy_(second_inputs_embeds_sliced)
         
         # 使用第二套持续性变量 的切片
         second_input_ids = self.micro_input_ids.gpu[:second_num_tokens] if input_ids is not None else None
@@ -2923,6 +3209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_input_tokens = ubatch_slices[0].num_tokens
 
             # Run the model.
+            print("Using Padding Execution Mode")
 
             # Use persistent buffers for CUDA graphs.
             with (set_forward_context(
@@ -2945,6 +3232,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
         elif self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
             print("Using Dual-Stream Parallel Execution Mode")
+            # 重放之前打印 attn_metadata 中张量的地址（调试用）
+            attn_meta_0_addrs = self._collect_attn_meta_addrs(attn_metadata[0])
+            print("attn_metadata[0] addresses:")
+            self._show_attn_meta_addrs(attn_meta_0_addrs)
+
+            attn_meta_1_addrs = self._collect_attn_meta_addrs(attn_metadata[1])
+            print("attn_metadata[1] addresses:")
+            self._show_attn_meta_addrs(attn_meta_1_addrs)
+
+            self._show_attn_meta_addrs_diff(attn_meta_0_addrs, attn_meta_1_addrs)
             model_output, kv_connector_output = self._execute_model_dual_cudagraph(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,  # 已经是 [first_metadata, second_metadata]
@@ -3620,6 +3917,61 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         pin_memory=self.pin_memory,
                         merge_by_field_config=model.merge_by_field_config,
                     ))
+    
+    def _collect_attn_meta_addrs(
+        self, attn_metadata: Optional[AttnMetadataDict]
+    ) -> Optional[dict[str, list[tuple[str, int]]]]:
+        """Return ptr/id info for the前两层的 attn_metadata，若不满足条件则返回 None。"""
+        if attn_metadata is None or not isinstance(attn_metadata, dict):
+            return None
+        if len(attn_metadata) < 2:
+            return None
+
+        layer_keys = list(attn_metadata.keys())
+        first_layer, second_layer = layer_keys[0], layer_keys[1]
+        attn_meta_addrs: dict[str, list[tuple[str, int]]] = {}
+
+        for layer_name in (first_layer, second_layer):
+            layer_obj = attn_metadata[layer_name]
+            layer_addrs: list[tuple[str, int]] = []
+            for key, tensor in layer_obj.__dict__.items():
+                if isinstance(tensor, torch.Tensor):
+                    layer_addrs.append((key, tensor.data_ptr()))
+                else:
+                    layer_addrs.append((key, id(tensor)))
+            attn_meta_addrs[f"layer_{layer_name}"] = layer_addrs
+
+        return attn_meta_addrs
+    
+    def _show_attn_meta_addrs_diff(
+        self,
+        before_addrs: Optional[dict[str, list[tuple[str, int]]]],
+        after_addrs: Optional[dict[str, list[tuple[str, int]]]],
+    ) -> None:
+        """Show the difference of attn_metadata ptr/id before and after dummy run."""
+        if before_addrs is None or after_addrs is None:
+            return
+        
+        for layer_name in before_addrs.keys():
+            before_layer_addrs = before_addrs[layer_name]
+            after_layer_addrs = after_addrs.get(layer_name, [])
+            print(f"Attention Metadata Address Diff for {layer_name}:")
+            for (key_b, addr_b), (key_a, addr_a) in zip(before_layer_addrs, after_layer_addrs):
+                if addr_b != addr_a:
+                    print(f"  Key: {key_b}, Before Addr: {addr_b}, After Addr: {addr_a}")
+
+    def _show_attn_meta_addrs(
+        self,
+        attn_meta_addrs: Optional[dict[str, list[tuple[str, int]]]],
+    ) -> None:
+        """Show the attn_metadata ptr/id info."""
+        if attn_meta_addrs is None:
+            return
+        
+        for layer_name, layer_addrs in attn_meta_addrs.items():
+            print(f"Attention Metadata Addresses for {layer_name}:")
+            for key, addr in layer_addrs:
+                print(f"  Key: {key}, Addr: {addr}")
 
     @torch.inference_mode()
     def _dummy_run(
@@ -3753,6 +4105,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             inputs_embeds_buffer = self.inputs_embeds
             is_token_ids_buffer = self.is_token_ids
+            if self.uses_mrope:
+                mrope_positions_buffer = self.mrope_positions
         else:  # StreamSlot.SECONDARY
             input_ids_buffer = self.micro_input_ids
             positions_buffer = self.micro_positions
@@ -3761,6 +4115,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             inputs_embeds_buffer = self.micro_inputs_embeds
             is_token_ids_buffer = self.micro_is_token_ids
+            if self.uses_mrope:
+                mrope_positions_buffer = self.micro_mrope_positions
 
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             attn_metadata = {}
@@ -3791,6 +4147,41 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                     self.kv_cache_config.kv_cache_groups):
+                
+                # attnmeta 也要两套缓冲区
+                # 1.25 使用 micro_input_batch 解决 
+                # 捕获的时候实现两套 attn meta 缓冲区
+                if stream_slot == StreamSlot.PRIMARY:
+                    common_attn_metadata = CommonAttentionMetadata(
+                        query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
+                        query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
+                                                                    1],
+                        seq_lens=self.seq_lens.gpu[:num_reqs],
+                        seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
+                        num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=max_query_len,
+                        max_seq_len=self.max_model_len,
+                        block_table_tensor=self.input_batch.block_table[kv_cache_group_id].get_device_tensor(num_reqs),
+                        slot_mapping=self.input_batch.block_table[kv_cache_group_id].slot_mapping.gpu[:num_tokens],causal=True)
+                
+                if stream_slot == StreamSlot.SECONDARY:
+                    common_attn_metadata = CommonAttentionMetadata(
+                        query_start_loc=self.micro_query_start_loc.gpu[:num_reqs + 1],
+                        query_start_loc_cpu=self.micro_query_start_loc.cpu[:num_reqs +
+                                                                    1],
+                        seq_lens=self.micro_seq_lens.gpu[:num_reqs],
+                        seq_lens_cpu=self.micro_seq_lens.cpu[:num_reqs],
+                        num_computed_tokens_cpu=self.micro_input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=max_query_len,
+                        max_seq_len=self.max_model_len,
+                        block_table_tensor=self.micro_input_batch.block_table[kv_cache_group_id].get_device_tensor(num_reqs),
+                        slot_mapping=self.micro_input_batch.block_table[kv_cache_group_id].slot_mapping.gpu[:num_tokens],causal=True)
+                    
+                
                 # common_attn_metadata = CommonAttentionMetadata(
                 #     query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
                 #     query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
@@ -3808,23 +4199,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 #     slot_mapping=self.input_batch.block_table[
                 #         kv_cache_group_id].slot_mapping.gpu[:num_tokens],
                 #     causal=True)
-                common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=query_start_loc_buffer.gpu[:num_reqs + 1],
-                    query_start_loc_cpu=query_start_loc_buffer.cpu[:num_reqs +
-                                                                 1],
-                    seq_lens=seq_lens_buffer.gpu[:num_reqs],
-                    seq_lens_cpu=seq_lens_buffer.cpu[:num_reqs],
-                    num_computed_tokens_cpu=self.input_batch.
-                    num_computed_tokens_cpu_tensor[:num_reqs],
-                    num_reqs=num_reqs,
-                    num_actual_tokens=num_tokens,
-                    max_query_len=max_query_len,
-                    max_seq_len=self.max_model_len,
-                    block_table_tensor=self.input_batch.
-                    block_table[kv_cache_group_id].get_device_tensor(num_reqs),
-                    slot_mapping=self.input_batch.block_table[
-                        kv_cache_group_id].slot_mapping.gpu[:num_tokens],
-                    causal=True)
                 for attn_group in self.attn_groups[kv_cache_group_id]:
                     if ubatch_slices is not None:
                         common_attn_metadata_list = split_attn_metadata(
@@ -3869,9 +4243,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds = None
 
             if self.uses_mrope:
-                positions = self.mrope_positions.gpu[:, :num_tokens]
+                # positions = self.mrope_positions.gpu[:, :num_tokens]
+                positions = mrope_positions_buffer.gpu[:, :num_tokens]
             else:
-                positions = self.positions.gpu[:num_tokens]
+                # positions = self.positions.gpu[:num_tokens]
+                positions = positions_buffer.gpu[:num_tokens]
+
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -3903,6 +4280,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if ubatch_slices is not None:
                 num_tokens = num_tokens // 2
             # stream_slot 是为了指定 pool 
+            print(f" dummy run {'primary' if stream_slot == StreamSlot.PRIMARY else 'secondary'} ")
             with self.maybe_randomize_inputs(input_ids), set_forward_context(
                     attn_metadata,
                     self.vllm_config,

@@ -111,25 +111,48 @@ def create_ubatch_slices(num_scheduled_tokens: np.ndarray, split_point: int) \
     -> UBatchSlices:
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)
+    # 待办事项（卢卡斯）：重构gpu_model_runner.py，以便我们可以直接传入cu_num_tokens（即query_start_loc）
+    ################################################################################
+    # E.g. num_scheduled_tokens = [2,5,3] -> cu_num_tokens = [0,2,7,10]
+    # split_point 是按照 total_num_scheduled_tokens  这个维度来算的 
+    # 这里假设是一半 split_point = 5
     cu_num_tokens = np.zeros(len(num_scheduled_tokens) + 1, dtype=np.int32)
     np.cumsum(num_scheduled_tokens, dtype=np.int32, out=cu_num_tokens[1:])
 
     first_ubatch_token_slice = slice(0, split_point)
+    # first_ubatch_token_slice = slice(0, 5)
     second_ubatch_token_slice = slice(split_point, cu_num_tokens[-1])
+    # second_ubatch_token_slice = slice(5, 10)
 
     # Determine request slices using exclusive stop semantics
-    # First ubatch includes requests whose tokens overlap [0, split_point)
+    # First ubatch includes requests whose tokens overlap [0, split_point)、
+    # 使用排他性终止语义确定请求分片
+    # 第一个微批次包含其令牌与 [0, 分割点) 重叠的请求
+    # 意思就是第一个微批次包含的请求是从第0个请求开始，到包含split_point令牌的请求结束
+    # 比如上面的split_point=5，那么第一个微批次就包含请求0和请求1，因为请求1的令牌范围是[2,7)，包含了split_point=5
+
+    # 这里使用left是因为如果split_point正好在边界上，我们希望第一个微批次包含该请求
+    # cu_num_tokens = [0,2,7,10] split_point=5
     first_ubatch_req_stop = int(
         np.searchsorted(cu_num_tokens, split_point, side="left"))
+    # first_ubatch_req_stop = 2
+
     first_ubatch_req_slice = slice(0, first_ubatch_req_stop)
+    # first_ubatch_req_slice = slice(0, 2)
+
 
     # Second ubatch starts at the request that contains the split_point
-    # or the request starting exactly at split_point (if on boundary)
+    # or the request starting exactly at split_point (if on boundary) 
+    # 使用right是因为如果split_point正好在边界上，我们希望第二个微批次从该请求开始
+    # 第二个微批从包含分割点的请求开始
+    # 或者正好从分割点开始的请求（如果在边界上）
+    # cu_num_tokens = [0,2,7,10] split_point=5
     second_ubatch_req_start = int(
         np.searchsorted(cu_num_tokens, split_point, side="right") - 1)
+    # second_ubatch_req_start = 2 - 1 = 1
     second_ubatch_req_slice = slice(second_ubatch_req_start,
                                     len(cu_num_tokens) - 1)
-
+    # second_ubatch_req_slice = slice(1, 3)
     # Return the two ubatch slices
     # 一个微批次切片包含请求切片和对应的令牌切片
     return [

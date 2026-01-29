@@ -30,12 +30,17 @@ class BlockTable:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
         self.device = device
+        # 使用CpuGpuBuffer存储block_table，方便在CPU和GPU之间传输 
+        # 可持续性
 
+        # block_table 是一个二维表格，行数为max_num_reqs，列数为max_num_blocks_per_req
+        # 每个请求对应一行，存储该请求所需的块ID [max_num_reqs, max_num_blocks_per_req]
         self.block_table = self._make_buffer(max_num_reqs,
                                              max_num_blocks_per_req,
                                              dtype=torch.int32)
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
+        # slot_mapping [max_num_batched_tokens] 用于存储每个token在KV缓存中的位置
         self.slot_mapping = self._make_buffer(self.max_num_batched_tokens,
                                               dtype=torch.int64)
         try:
@@ -75,12 +80,26 @@ class BlockTable:
 
     def compute_slot_mapping(self, req_indices: np.ndarray,
                              positions: np.ndarray) -> None:
+        # 计算slot mapping 用于定位KV缓存中的位置 
+        # 输入 req_indices: (num_tokens,) 每个token对应的请求索引
+        #       positions: (num_tokens,) 每个token在对应请求中的位置
+
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
+        # 请求分别为[0,1],[0,1,2,3,4],[0,1,2] 三个请求
+        # 每个请求的最大块数为K block_size为2 代表一个block可以包含两个token 的KV缓存位置
+        # 这里对于第一个请求 有两个token 需要第0块就足够了
+        # 对于第二个请求 有5个token 需要3块 (0,1),(2,3),(4) 但又由于每个请求最大块数为K 所以需要跨过K块 K,K,K+1,K+1,K+2 就可以了
+        # 对于第三个请求 有3个token 需要2块 (0,1),(2) 需要跨过2*K块 2*K,2*K,2*K+1 就可以了
+
         # where K is the max_num_blocks_per_req and the block size is 2.
         # NOTE(woosuk): We can't simply use `token_indices // block_size`
         # here because M (max_model_len) is not necessarily divisible by
         # block_size.
+        # 其中K是每个请求的最大块数（max_num_blocks_per_req），且块大小为2。
+        # 注意（禹锡）：此处不能简单使用`token_indices // block_size`
+        # 因为M（最大模型长度，max_model_len）不一定能被
+        # 块大小（block_size）整除。
         if self.dcp_world_size > 1:
             # Note(hc): The DCP implement store kvcache with an interleave
             # style, the kvcache for the token whose token_idx is i is
@@ -113,6 +132,7 @@ class BlockTable:
                    out=self.slot_mapping.np[:req_indices.shape[0]])
 
     def commit_block_table(self, num_reqs: int) -> None:
+        # 将block_table从CPU传输到GPU
         self.block_table.copy_to_gpu(num_reqs)
 
     def commit_slot_mapping(self, num_tokens: int) -> None:

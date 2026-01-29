@@ -49,32 +49,50 @@ class CommonAttentionMetadata:
     
     For many of the tensors we keep both GPU and CPU versions.
     """
+    # 每批次的注意力元数据，在层和后端之间共享。
 
     query_start_loc: torch.Tensor
     query_start_loc_cpu: torch.Tensor
     """(batch_size + 1,), the start location of each request in query Tensor"""
+    # 每个请求在查询张量中的起始位置 大小是(batch_size + 1,) 累积和
 
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     """(batch_size,), the length of each request including both computed tokens
     and newly scheduled tokens"""
+    # 每个请求的长度，包括计算的令牌和新调度的令牌 大小是(batch_size,)
 
     num_computed_tokens_cpu: torch.Tensor
     """(batch_size,), the number of computed tokens for each request"""
+    # 每个请求的计算令牌数量 大小是(batch_size,)
 
     num_reqs: int
     """Number of requests"""
+    # 请求数量
+
     num_actual_tokens: int
     """Total number of tokens in batch"""
+    # 批次中的令牌总数
+
     max_query_len: int
     """Longest query in batch"""
+    # 批次中最长的查询
+
     max_seq_len: int
     """Longest context length in batch"""
+    # 批次中最长的上下文长度
 
     block_table_tensor: torch.Tensor
+    """(num_reqs, pages_per_batch), block table for each request"""
+    # 每个请求的块表 大小是(num_reqs, pages_per_batch)
+
     slot_mapping: torch.Tensor
+    """(num_actual_tokens,), mapping from token index to slot index in KV cache"""
+    # 从令牌索引到KV缓存中槽索引的映射 大小是(num_actual_tokens,)
 
     causal: bool = True
+    """Whether the attention is causal"""
+    # 注意力是否是因果的
 
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: Optional[torch.Tensor] = None
@@ -190,6 +208,29 @@ def _make_metadata_with_slice(
         slot_mapping=slot_mapping,
     )
 
+
+def split_attn_metadata_with_micro(
+    ubatch_slices: list[UBatchSlice],
+    common_attn_metadata: CommonAttentionMetadata,
+    micro_common_attn_metadata: CommonAttentionMetadata,
+) -> list[CommonAttentionMetadata]:
+    """
+    Creates a new CommonAttentionMetadata instance that corresponds to the 
+    requests for each UBatchSlice in ubatch_slices.
+
+    Note: This function does not modify common_attn_metadata
+    """
+    results = []
+    # TODO 两个ubatch 对应的metadata 放在不同的缓存区中
+    results.append(_make_metadata_with_slice(ubatch_slices[0],common_attn_metadata))
+    results.append(_make_metadata_with_slice(ubatch_slices[1],micro_common_attn_metadata))
+
+    # 还有一个问题 就是这里是 micro_common_attn_metadata 的后半部分切片 也就是持续性地址的后半部分
+    # 这不符合要求 还要把得到的common_attn_metadata 数据复制到micro缓冲区的前半部分
+    # 那还不如直接把正常common_attn_metadata[1] 复制到micro缓冲区的前半部分 
+    # 甚至更进一步 把正常构建的attn_metadata 直接复制到micro缓冲区的前半部分 对应的位置
+
+    return results
 
 def split_attn_metadata(
     ubatch_slices: list[UBatchSlice],

@@ -38,6 +38,9 @@ class CUDAGraphEntry:
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
 
+    # track attn_metadata tensor addresses for layer 0 and layer 1
+    attn_metadata_addresses: Optional[dict[str, list[tuple[str, int]]]] = None
+
 
 @dataclasses.dataclass
 class CUDAGraphOptions:
@@ -121,6 +124,7 @@ class CUDAGraphWrapper:
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
         stream_slot: StreamSlot = forward_context.stream_slot
+        attn_metadata = forward_context.attn_metadata
 
         if cudagraph_runtime_mode == CUDAGraphMode.NONE or \
                             cudagraph_runtime_mode != self.runtime_mode:
@@ -163,9 +167,54 @@ class CUDAGraphWrapper:
             validate_cudagraph_capturing_enabled()
 
             input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
             ]
+            input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
+                                    for _, v in kwargs.items()])
             entry.input_addresses = input_addresses
+            # 新增代码：记录 attn_metadata 地址
+            if attn_metadata is not None and len(attn_metadata) >= 2:
+                attn_meta_addrs = {}
+                
+                first_layer = list(attn_metadata.keys())[0]
+                second_layer = list(attn_metadata.keys())[1]
+                
+                # 记录第0层
+                layer0_addrs = []
+                attn_metadata_layer0 = attn_metadata[first_layer]
+                for key, tensor in attn_metadata_layer0.__dict__.items():
+                    if isinstance(tensor, torch.Tensor):
+                        layer0_addrs.append((key, tensor.data_ptr()))
+                    else:
+                        layer0_addrs.append((key, id(tensor)))
+                attn_meta_addrs[f'layer_{first_layer}'] = layer0_addrs
+                
+                # 记录第1层
+                layer1_addrs = []
+                attn_metadata_layer1 = attn_metadata[second_layer]
+                for key, tensor in attn_metadata_layer1.__dict__.items():
+                    if isinstance(tensor, torch.Tensor):
+                        layer1_addrs.append((key, tensor.data_ptr()))
+                    else:
+                        layer1_addrs.append((key, id(tensor)))
+                attn_meta_addrs[f'layer_{second_layer}'] = layer1_addrs
+                
+                entry.attn_metadata_addresses = attn_meta_addrs
+            # print(f"=== CAPTURE CUDAGRAPH | slot={stream_slot.name} | pool={current_graph_pool} | num_tokens={batch_descriptor.num_tokens} ===")
+            # print(f"Captured tensor addresses: {input_addresses}")
+            # print(f"\nArgs ({len(args)} items):")
+            # for i, x in enumerate(args):
+            #     if isinstance(x, torch.Tensor):
+            #         print(f"  [{i}] Tensor: shape={x.shape}, dtype={x.dtype}, addr={x.data_ptr()}")
+            #     else:
+            #         print(f"  [{i}] {type(x).__name__}: value={x}, id={id(x)}")
+            # print(f"\nKwargs ({len(kwargs)} items):")
+            # for k, v in kwargs.items():
+            #     if isinstance(v, torch.Tensor):
+            #         print(f"  {k}: Tensor shape={v.shape}, dtype={v.dtype}, addr={v.data_ptr()}")
+            #     else:
+            #         print(f"  {k}: {type(v).__name__} value={v}, id={id(v)}")
+
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -214,13 +263,90 @@ class CUDAGraphWrapper:
         if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
             ]
+            new_input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
+        
+        # new_input_addresses = []
+        # new_input_addresses.extend([x.data_ptr() for x in args if isinstance(x, torch.Tensor)])
+        # new_input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
+        new_input_addresses = [
+                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
+            ]
+        new_input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
+                                    for _, v in kwargs.items()])
+        assert new_input_addresses == entry.input_addresses, (
+            f"Input addresses for cudagraphs are different "
+            f"during replay. Expected {entry.input_addresses}, "
+            f"got {new_input_addresses}")
+        # print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | pool={current_graph_pool} | stream={torch.cuda.current_stream()} | num_tokens={batch_descriptor.num_tokens} ===")
+        # print(f"Captured addresses: {entry.input_addresses}")
+        # print(f"Replay addresses:   {new_input_addresses}")
+        # print(f"Address match: {new_input_addresses == entry.input_addresses}")
 
-        print(f"Replay on stream {torch.cuda.current_stream()} ,num_tokens: {batch_descriptor.num_tokens}")
+        if self.is_debugging_mode:
+            print(f"\nArgs ({len(args)} items):")
+            for i, x in enumerate(args):
+                if isinstance(x, torch.Tensor):
+                    print(f"  [{i}] Tensor: shape={x.shape}, dtype={x.dtype}, addr={x.data_ptr()}")
+                else:
+                    print(f"  [{i}] {type(x).__name__}: value={x}, id={id(x)}")
+
+            print(f"\nKwargs ({len(kwargs)} items):")
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  {k}: Tensor shape={v.shape}, dtype={v.dtype}, addr={v.data_ptr()}")
+                else:
+                    print(f"  {k}: {type(v).__name__} value={v}, id={id(v)}")
+                    
+        #  新增：比较 attn_metadata 地址
+        if entry.attn_metadata_addresses is not None and attn_metadata is not None:
+            first_layer = list(attn_metadata.keys())[0]
+            second_layer = list(attn_metadata.keys())[1]
+            
+            # 获取当前的 attn_metadata 地址
+            current_attn_addrs = {}
+            
+            # 第0层
+            layer0_addrs = []
+            attn_metadata_layer0 = attn_metadata[first_layer]
+            for key, tensor in attn_metadata_layer0.__dict__.items():
+                if isinstance(tensor, torch.Tensor):
+                    layer0_addrs.append((key, tensor.data_ptr()))
+                else:
+                    layer0_addrs.append((key, id(tensor)))
+            current_attn_addrs[f'layer_{first_layer}'] = layer0_addrs
+            
+            # 第1层
+            layer1_addrs = []
+            attn_metadata_layer1 = attn_metadata[second_layer]
+            for key, tensor in attn_metadata_layer1.__dict__.items():
+                if isinstance(tensor, torch.Tensor):
+                    layer1_addrs.append((key, tensor.data_ptr()))
+                else:
+                    layer1_addrs.append((key, id(tensor)))
+            current_attn_addrs[f'layer_{second_layer}'] = layer1_addrs
+            
+            # 比较地址
+            if current_attn_addrs != entry.attn_metadata_addresses:
+                print("CUDA GRAPH ATTENTION METADATA ADDRESS MISMATCH DETECTED!")
+                print(f"=== ATTN_METADATA ADDRESS MISMATCH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
+                for layer_key in current_attn_addrs.keys():
+                    captured = dict(entry.attn_metadata_addresses[layer_key])
+                    current = dict(current_attn_addrs[layer_key])
+                    for attr_name in captured.keys():
+                        if captured[attr_name] != current.get(attr_name):
+                            print(f"  [{layer_key}] {attr_name}: captured={captured[attr_name]}, current={current.get(attr_name)}")
+                
+                if self.is_debugging_mode:
+                    assert False, (
+                        f"Attn_metadata addresses are different during replay. "
+                        f"Captured: {entry.attn_metadata_addresses}, "
+                        f"Current: {current_attn_addrs}")
+        # print(f"Replay on stream {torch.cuda.current_stream()} ,num_tokens: {batch_descriptor.num_tokens}")
         entry.cudagraph.replay()
         return entry.output
