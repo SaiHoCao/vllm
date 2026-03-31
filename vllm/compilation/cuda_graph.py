@@ -185,8 +185,8 @@ class CUDAGraphWrapper:
                 for key, tensor in attn_metadata_layer0.__dict__.items():
                     if isinstance(tensor, torch.Tensor):
                         layer0_addrs.append((key, tensor.data_ptr()))
-                    else:
-                        layer0_addrs.append((key, id(tensor)))
+                    # else:
+                    #     layer0_addrs.append((key, id(tensor)))
                 attn_meta_addrs[f'layer_{first_layer}'] = layer0_addrs
                 
                 # 记录第1层
@@ -195,8 +195,8 @@ class CUDAGraphWrapper:
                 for key, tensor in attn_metadata_layer1.__dict__.items():
                     if isinstance(tensor, torch.Tensor):
                         layer1_addrs.append((key, tensor.data_ptr()))
-                    else:
-                        layer1_addrs.append((key, id(tensor)))
+                    # else:
+                    #     layer1_addrs.append((key, id(tensor)))
                 attn_meta_addrs[f'layer_{second_layer}'] = layer1_addrs
                 
                 entry.attn_metadata_addresses = attn_meta_addrs
@@ -317,8 +317,8 @@ class CUDAGraphWrapper:
             for key, tensor in attn_metadata_layer0.__dict__.items():
                 if isinstance(tensor, torch.Tensor):
                     layer0_addrs.append((key, tensor.data_ptr()))
-                else:
-                    layer0_addrs.append((key, id(tensor)))
+                # else:
+                #     layer0_addrs.append((key, id(tensor)))
             current_attn_addrs[f'layer_{first_layer}'] = layer0_addrs
             
             # 第1层
@@ -327,8 +327,8 @@ class CUDAGraphWrapper:
             for key, tensor in attn_metadata_layer1.__dict__.items():
                 if isinstance(tensor, torch.Tensor):
                     layer1_addrs.append((key, tensor.data_ptr()))
-                else:
-                    layer1_addrs.append((key, id(tensor)))
+                # else:
+                #     layer1_addrs.append((key, id(tensor)))
             current_attn_addrs[f'layer_{second_layer}'] = layer1_addrs
             
             # 比较地址

@@ -29,7 +29,7 @@ def create_parser():
 
     }
     parser.set_defaults(compilation_config=compilation_config)
-    parser.set_defaults(model="/home/csh/data/Qwen3-4B")
+    parser.set_defaults(model="/home/csh/data/Qwen3-0.6B")
     parser.set_defaults(max_model_len=8192)  # 支持长序列
 
     # --no-enable-chunked-prefill # 关闭分块预填充，简化测试逻辑
@@ -48,7 +48,7 @@ def create_parser():
                            help="Minimum sequence length (tokens)")
     test_group.add_argument("--max-seq-len", type=int, default=2048,
                            help="Maximum sequence length (tokens)")
-    test_group.add_argument("--max-tokens", type=int, default=128,
+    test_group.add_argument("--max-tokens", type=int, default=16,
                            help="Maximum generation length")
     test_group.add_argument("--seed_r", type=int, default=42,
                            help="Random seed")
@@ -156,7 +156,7 @@ def run_test_case(llm: LLM, prompts: list[str],
         
         # 打印部分输出示例
         print(f"\n  Sample outputs:")
-        for i, output in enumerate(outputs[:15]):
+        for i, output in enumerate(outputs):
             generated_text = output.outputs[0].text.strip().replace("\n", " ")
             print(f"    [{i}] {generated_text}")
             
