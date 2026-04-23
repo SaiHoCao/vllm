@@ -16,24 +16,31 @@ def create_parser():
     # Add engine args
     EngineArgs.add_cli_args(parser)
     
-    cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)] # [1,2,4,8,16,32,64,128,192,256,320,384,448,512]
-    
+    # cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)] + [896] # [1,2,4,8,16,32,64,128,192,256,320,384,448,512]
+    cudagraph_sizes = [1, 2, 4, 8, 16, 32, 64] + [i * 128 for i in range(1, 6)] + [896]
+
+
     compilation_config = {
         "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
         # "replay_mode": "DUAL_MIXED",
         # "replay_mode": "DUAL_SERIAL",
-        "replay_mode": "DUAL_PARALLEL",
-        # "replay_mode": "PADDING",
+        # "replay_mode": "DUAL_PARALLEL", 
+        "replay_mode": "PADDING",
+        # "replay_mode": "DUAL_INPLACE",
 
     }
     parser.set_defaults(compilation_config=compilation_config)
-    parser.set_defaults(model="/home/csh/data/Qwen3-0.6B")
-    parser.set_defaults(max_model_len=8192)  # 支持长序列
+    parser.set_defaults(model="/home/csh/data/Qwen3-4B")
+    parser.set_defaults(max_model_len=16384)  # 支持长序列
 
     # --no-enable-chunked-prefill # 关闭分块预填充，简化测试逻辑
     parser.set_defaults(enable_chunked_prefill=False)
+    # Disable continuous batching to simplify testing logic
+    # 禁用前缀匹配
+    parser.set_defaults(enable_prefix_caching=False)
+    
     
     # Test parameters
     test_group = parser.add_argument_group("Test parameters")
@@ -48,7 +55,7 @@ def create_parser():
                            help="Minimum sequence length (tokens)")
     test_group.add_argument("--max-seq-len", type=int, default=2048,
                            help="Maximum sequence length (tokens)")
-    test_group.add_argument("--max-tokens", type=int, default=16,
+    test_group.add_argument("--max-tokens", type=int, default=128,
                            help="Maximum generation length")
     test_group.add_argument("--seed_r", type=int, default=42,
                            help="Random seed")
@@ -156,7 +163,7 @@ def run_test_case(llm: LLM, prompts: list[str],
         
         # 打印部分输出示例
         print(f"\n  Sample outputs:")
-        for i, output in enumerate(outputs):
+        for i, output in enumerate(outputs[:10]):
             generated_text = output.outputs[0].text.strip().replace("\n", " ")
             print(f"    [{i}] {generated_text}")
             
@@ -244,12 +251,12 @@ def main(args: dict):
     # batch_sizes = [bs for bs in batch_sizes if min_batch_size <= bs <= max_batch_size]
     # batch_sizes = sorted(set(batch_sizes))  # 去重并排序
 
-    batch_sizes = [400]  # 仅测试两个 batch size，快速验证功能
+    batch_sizes = [600]  # 仅测试两个 batch size，快速验证功能
     
     # 为每个 batch size 随机生成一个 seq_len
     for batch_size in batch_sizes:
         # seq_len = random.randint(min_seq_len, max_seq_len)
-        seq_len = 200  # 固定 seq_len，快速验证功能
+        seq_len = 1024  # 固定 seq_len，快速验证功能
         test_configs.append((batch_size, seq_len))
     
     print(f"\n{'='*70}")

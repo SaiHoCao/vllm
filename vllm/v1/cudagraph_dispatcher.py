@@ -121,5 +121,32 @@ class CudagraphDispatcher:
         if non_uniform_key in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
             return CUDAGraphMode.PIECEWISE, non_uniform_key
 
+        # Lazy key support:
+        # If BatchDescriptor contains extra fields (e.g. start_num_tokens for
+        # split / single-buffer replay), it will not match the pre-generated
+        # keys initialized in initialize_cudagraph_keys(). In that case, we
+        # allow dispatching based on the batch size only and dynamically add
+        # the key so that cudagraph wrappers can capture/replay it.
+        #
+        # This keeps the upfront key space small while still allowing users to
+        # distinguish graphs by additional descriptor fields.
+        capture_sizes = set(self.compilation_config.cudagraph_capture_sizes)
+        if batch_descriptor.num_tokens in capture_sizes:
+            # Prefer decode FULL graphs when requested and available.
+            if batch_descriptor.uniform_decode and \
+                self.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL and \
+                    self.cudagraph_mode.separate_routine():
+                self.add_cudagraph_key(CUDAGraphMode.FULL, batch_descriptor)
+                return CUDAGraphMode.FULL, batch_descriptor
+
+            mixed_mode = self.cudagraph_mode.mixed_mode()
+            if mixed_mode != CUDAGraphMode.NONE:
+                # For mixed-mode graphs we dispatch uniform batches to the
+                # non-uniform graph (more general), keeping start_num_tokens.
+                key = batch_descriptor if not batch_descriptor.uniform_decode \
+                    else batch_descriptor.non_uniform
+                self.add_cudagraph_key(mixed_mode, key)
+                return mixed_mode, key
+
         # finally, just return no cudagraphs
         return CUDAGraphMode.NONE, None

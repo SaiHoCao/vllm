@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
-
+import torch.cuda.nvtx as nvtx
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
@@ -154,8 +154,9 @@ class CUDAGraphWrapper:
                     CUDAGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = current_entries[batch_descriptor]
-
         if entry.cudagraph is None:
+            # print(f"=== CAPTURE CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
+            nvtx.range_push(f" CAPTURE CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens}")
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -172,6 +173,7 @@ class CUDAGraphWrapper:
             input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
                                     for _, v in kwargs.items()])
             entry.input_addresses = input_addresses
+            
             # 新增代码：记录 attn_metadata 地址
             if attn_metadata is not None and len(attn_metadata) >= 2:
                 attn_meta_addrs = {}
@@ -200,20 +202,6 @@ class CUDAGraphWrapper:
                 attn_meta_addrs[f'layer_{second_layer}'] = layer1_addrs
                 
                 entry.attn_metadata_addresses = attn_meta_addrs
-            # print(f"=== CAPTURE CUDAGRAPH | slot={stream_slot.name} | pool={current_graph_pool} | num_tokens={batch_descriptor.num_tokens} ===")
-            # print(f"Captured tensor addresses: {input_addresses}")
-            # print(f"\nArgs ({len(args)} items):")
-            # for i, x in enumerate(args):
-            #     if isinstance(x, torch.Tensor):
-            #         print(f"  [{i}] Tensor: shape={x.shape}, dtype={x.dtype}, addr={x.data_ptr()}")
-            #     else:
-            #         print(f"  [{i}] {type(x).__name__}: value={x}, id={id(x)}")
-            # print(f"\nKwargs ({len(kwargs)} items):")
-            # for k, v in kwargs.items():
-            #     if isinstance(v, torch.Tensor):
-            #         print(f"  {k}: Tensor shape={v.shape}, dtype={v.dtype}, addr={v.data_ptr()}")
-            #     else:
-            #         print(f"  {k}: {type(v).__name__} value={v}, id={id(v)}")
 
             cudagraph = torch.cuda.CUDAGraph()
 
@@ -233,7 +221,7 @@ class CUDAGraphWrapper:
                     set_graph_pool_id(current_graph_pool)
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
-                print(f"Capture cudagraph on stream {torch.cuda.current_stream()},pool {current_graph_pool}, num_tokens: {batch_descriptor.num_tokens}")
+                
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=current_graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
@@ -253,6 +241,7 @@ class CUDAGraphWrapper:
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
+            nvtx.range_pop()
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
@@ -283,10 +272,6 @@ class CUDAGraphWrapper:
             f"Input addresses for cudagraphs are different "
             f"during replay. Expected {entry.input_addresses}, "
             f"got {new_input_addresses}")
-        # print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | pool={current_graph_pool} | stream={torch.cuda.current_stream()} | num_tokens={batch_descriptor.num_tokens} ===")
-        # print(f"Captured addresses: {entry.input_addresses}")
-        # print(f"Replay addresses:   {new_input_addresses}")
-        # print(f"Address match: {new_input_addresses == entry.input_addresses}")
 
         if self.is_debugging_mode:
             print(f"\nArgs ({len(args)} items):")
@@ -347,6 +332,13 @@ class CUDAGraphWrapper:
                         f"Attn_metadata addresses are different during replay. "
                         f"Captured: {entry.attn_metadata_addresses}, "
                         f"Current: {current_attn_addrs}")
-        # print(f"Replay on stream {torch.cuda.current_stream()} ,num_tokens: {batch_descriptor.num_tokens}")
-        entry.cudagraph.replay()
+        print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
+        if stream_slot == StreamSlot.PRIMARY:
+            nvtx.range_push(f"CUDAGraph Replay Primary num_tokens: {batch_descriptor.num_tokens}")
+            entry.cudagraph.replay()
+            nvtx.range_pop()
+        else:
+            nvtx.range_push(f"CUDAGraph Replay Secondary num_tokens: {batch_descriptor.num_tokens}")
+            entry.cudagraph.replay()
+            nvtx.range_pop()
         return entry.output

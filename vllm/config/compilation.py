@@ -71,6 +71,7 @@ class ReplayMode(enum.Enum):
     DUAL_SERIAL = 1
     DUAL_PARALLEL = 2
     DUAL_MIXED = 3
+    DUAL_INPLACE = 4
 
 
 @config

@@ -15,18 +15,23 @@ def create_parser():
     # Add engine args
     EngineArgs.add_cli_args(parser)
     
-    cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)]
+    # cudagraph_sizes = [1, 2, 4, 8, 16, 32, 64] + [i * 128 for i in range(1, 6)]
+    cudagraph_sizes = [1, 2, 4, 8, 16, 32, 64,128] + [i * 256 for i in range(1, 4)] + [896]
+    
     
     compilation_config = {
         "level": "3",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
-        "enable_cudagraph_split": True,
-        "enable_dual_graph": True,
+        # "replay_mode": "DUAL_MIXED",
+        # "replay_mode": "DUAL_SERIAL",
+        # "replay_mode": "DUAL_PARALLEL", 
+        # "replay_mode": "PADDING",
+        "replay_mode": "DUAL_INPLACE",
     }
     parser.set_defaults(compilation_config=compilation_config)
     parser.set_defaults(model="/home/csh/data/Qwen3-4B")
-    parser.set_defaults(max_model_len=8192)
+    parser.set_defaults(max_model_len=16384)
 
     # 关键设置：禁用分块预填充和连续批处理
     parser.set_defaults(enable_chunked_prefill=False)
@@ -41,19 +46,19 @@ def create_parser():
     test_group.add_argument("--dataset-path", type=str, 
                            default="/home/csh/data/projects/datasets/LongBench-v2",
                            help="Path to LongBench-v2 dataset")
-    test_group.add_argument("--min-batch-size", type=int, default=50,
-                           help="Minimum batch size")
-    test_group.add_argument("--max-batch-size", type=int, default=512,
+    test_group.add_argument("--min-batch-size", type=int, default=256,
+                           help="Minimum batch size to start observing")
+    test_group.add_argument("--max-batch-size", type=int, default=896,
                            help="Maximum batch size")
-    test_group.add_argument("--batch-step", type=int, default=100,
-                           help="Batch size step")
-    test_group.add_argument("--seq-len", type=int, default=200,
-                           help="Fixed sequence length (tokens)")
+    test_group.add_argument("--seq-lens", type=str, default="1024",
+                           help="Comma-separated sequence lengths to test")
+    test_group.add_argument("--max-kv-tokens", type=int, default=2097152,
+                           help="Skip tests where batch*seq exceeds this")
     test_group.add_argument("--warmup-rounds", type=int, default=0,
                            help="Number of warmup rounds before measurement")
-    test_group.add_argument("--baseline-tokens", type=int, default=14,
-                           help="Baseline decode tokens (usually 1)")
-    test_group.add_argument("--target-tokens", type=int, default=64,
+    test_group.add_argument("--baseline-tokens", type=int, default=32,
+                           help="Baseline decode tokens ")
+    test_group.add_argument("--target-tokens", type=int, default=132,
                            help="Target decode tokens to measure")
     test_group.add_argument("--seed_r", type=int, default=42,
                            help="Random seed")
@@ -113,7 +118,7 @@ def measure_decode_time(llm: LLM, prompts: list[str],
         llm: LLM 实例
         prompts: 输入 prompts
         warmup_rounds: CUDA Graph 预热轮数
-        baseline_tokens: 基准 decode token 数 (通常为 1)
+        baseline_tokens: 基准 decode token 数 (为了消除连续批处理尾部的动态batch)
         target_tokens: 目标 decode token 数
         test_id: 测试编号
         batch_size: 批次大小
@@ -137,7 +142,7 @@ def measure_decode_time(llm: LLM, prompts: list[str],
         if warmup_rounds > 0:
             print(f"  [0/3] Warming up CUDA graphs ({warmup_rounds} rounds)...")
             warmup_params = SamplingParams(
-                max_tokens=target_tokens, 
+                max_tokens=baseline_tokens, 
                 temperature=0.0, 
                 ignore_eos=True
             )
@@ -270,19 +275,66 @@ def measure_decode_time(llm: LLM, prompts: list[str],
     return result
 
 
+def get_matched_bucket(batch_size: int, buckets: list[int]) -> int:
+    """Return the smallest bucket >= batch_size (padding up)."""
+    for bucket in sorted(buckets):
+        if batch_size <= bucket:
+            return bucket
+    return batch_size
+
+
+def generate_anchor_batches(buckets: list[int], min_bs: int,
+                            max_bs: int) -> list[int]:
+    """Generate anchor batch sizes based on inter-bucket gaps.
+
+    For each bucket B, define lower L as the previous bucket (or min_bs if the
+    previous bucket is smaller). Then sample:
+      batch = L + (B - L) * ratio
+    This expresses "padding amount as % of the bucket gap".
+    """
+    sorted_buckets = sorted(set(buckets))
+    # ratio is "how far we are from lower to bucket".
+    # e.g. between 128 and 256, ratio=0.5 -> 128 + (256-128)*0.5 = 192 (pad=64).
+    ratios = [0.75, 0.50, 0.25]
+
+    test_batches: set[int] = set()
+    prev: Optional[int] = None
+    for bucket in sorted_buckets:
+        if bucket <= min_bs or bucket > max_bs:
+            prev = bucket
+            continue
+
+        lower = min_bs if prev is None else max(min_bs, prev)
+        if lower >= bucket:
+            test_batches.add(bucket)
+            prev = bucket
+            continue
+
+        gap = bucket - lower
+        for r in ratios:
+            batch = int(round(lower + gap * r))
+            batch = min(max(batch, min_bs), max_bs)
+            if batch <= bucket:
+                test_batches.add(batch)
+        prev = bucket
+
+    return sorted(test_batches)
+
+
 def main(args: dict):
     # Pop test parameters
     dataset_path = args.pop("dataset_path")
     min_batch_size = args.pop("min_batch_size")
     max_batch_size = args.pop("max_batch_size")
-    batch_step = args.pop("batch_step")
-    seq_len = args.pop("seq_len")
+    seq_lens_str = args.pop("seq_lens")
+    max_kv_tokens = args.pop("max_kv_tokens")
     warmup_rounds = args.pop("warmup_rounds")
     baseline_tokens = args.pop("baseline_tokens")
     target_tokens = args.pop("target_tokens")
     seed = args.pop("seed_r")
     
     random.seed(seed)
+    seq_lens = [int(s.strip()) for s in seq_lens_str.split(",") if s.strip()]
     
     # Load dataset
     print(f"Loading dataset from {dataset_path}...")
@@ -301,20 +353,33 @@ def main(args: dict):
     print("\nInitializing LLM...")
     llm = LLM(**args)
     
-    # Generate batch sizes to test
-    batch_sizes = list(range(min_batch_size, max_batch_size + 1, batch_step))
-    if max_batch_size not in batch_sizes:
-        batch_sizes.append(max_batch_size)
-    batch_sizes = sorted(batch_sizes)
+    # Extract CUDA Graph buckets (padding targets)
+    cudagraph_sizes = args.get("compilation_config",
+                              {}).get("cudagraph_capture_sizes", [])
+    if not cudagraph_sizes:
+        # cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)] + [992]
+        cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 128 for i in range(1, 8)]
+    # Generate anchor batch sizes around each bucket
+    batch_sizes = generate_anchor_batches(cudagraph_sizes, min_batch_size,
+                                         max_batch_size)
 
-    # batch_sizes = [35]  # 临时指定批次大小，快速验证功能
+    # Build test matrix (batch, seq_len), with KV cache guardrail
+    test_configs: list[tuple[int, int]] = []
+    for seq_len in seq_lens:
+        for batch_size in batch_sizes:
+            if batch_size * seq_len > max_kv_tokens:
+                print(f"Skipping (Batch: {batch_size}, Seq: {seq_len}) -> "
+                      f"{batch_size * seq_len} tokens exceeds max_kv_tokens="
+                      f"{max_kv_tokens}.")
+                continue
+            test_configs.append((batch_size, seq_len))
     
     print(f"\n{'='*80}")
-    print("Test Configuration")
+    print("Test Configuration: Anchor Matrix")
     print(f"{'='*80}")
-    print(f"Number of tests      : {len(batch_sizes)}")
-    print(f"Batch sizes          : {batch_sizes}")
-    print(f"Sequence length      : {seq_len} tokens")
+    print(f"Total test points    : {len(test_configs)}")
+    print(f"Test batch anchors   : {batch_sizes}")
+    print(f"Sequence lengths     : {seq_lens}")
     print(f"Baseline tokens      : {baseline_tokens}")
     print(f"Target tokens        : {target_tokens}")
     print(f"Decode steps measured: {target_tokens - baseline_tokens}")
@@ -323,23 +388,24 @@ def main(args: dict):
     
     # Run tests
     results = []
-    for i, batch_size in enumerate(batch_sizes):
+    warmed_buckets: set[int] = set()
+    for i, (batch_size, seq_len) in enumerate(test_configs):
         # 清理之前的 LLM 实例和 GPU 资源
-        del llm
-        print("\nCleaning up GPU resources...")
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        # del llm
+        # print("\nCleaning up GPU resources...")
+        # import torch
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+        #     torch.cuda.synchronize()
         
-        import gc
-        gc.collect()
+        # import gc
+        # gc.collect()
         
-        time.sleep(2)  # 等待资源释放
+        # time.sleep(1)  # 等待资源释放
 
-        print(f"\nCreating new LLM instance for Batch Size: {batch_size}...")
+        print(f"\n[{i+1}/{len(test_configs)}] Testing Batch: {batch_size}, Seq: {seq_len} ...")
         
-        llm = LLM(**args)
+        # llm = LLM(**args)
 
         if dataset is not None:
             prompts = prepare_prompts_from_dataset(dataset, batch_size, seq_len)
@@ -347,17 +413,31 @@ def main(args: dict):
             base_text = "This is a test prompt. " * (seq_len // 5)
             prompts = [f"{base_text}\n\nSummarize:" for _ in range(batch_size)]
         
+        matched_bucket = get_matched_bucket(batch_size, cudagraph_sizes)
+        warmup_for_this = warmup_rounds if matched_bucket not in warmed_buckets else 0
+
         result = measure_decode_time(
             llm=llm,
             prompts=prompts,
-            warmup_rounds=warmup_rounds,
+            warmup_rounds=warmup_for_this,
             baseline_tokens=baseline_tokens,
             target_tokens=target_tokens,
             test_id=i + 1,
             batch_size=batch_size,
             seq_len=seq_len
         )
+        # matched_bucket = get_matched_bucket(batch_size, cudagraph_sizes)
+        result["matched_bucket"] = matched_bucket
+        result["padding_batch"] = matched_bucket - batch_size
+        result["padding_waste_pct"] = (matched_bucket - batch_size) / matched_bucket * 100
         results.append(result)
+
+        warmed_buckets.add(matched_bucket)
+        # Best-effort cache cleanup to reduce fragmentation without resetting graphs.
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
     
     # Summary
     print(f"\n{'='*100}")
@@ -377,11 +457,11 @@ def main(args: dict):
             print(f"  - Batch {r['batch_size']}: {r.get('error', 'Unknown error')}")
     
     # Detailed results table
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print("Detailed Results")
-    print(f"{'='*110}")
-    print(f"{'Batch':<8} {'SeqLen':<8} {'TTFT(s)':<10} {'Decode(s)':<10} {'Steps':<8} {'TPOT(ms)':<12} {'Throughput':<14} {'Status':<8}")
-    print("-" * 110)
+    print(f"{'='*120}")
+    print(f"{'Batch':<8} {'Bucket':<8} {'Pad':<6} {'Waste%':<8} {'SeqLen':<8} {'TTFT(s)':<10} {'Decode(s)':<10} {'TPOT(ms)':<10} {'Throughput':<12} {'Status':<8}")
+    print("-" * 120)
     
     for r in results:
         status = "✅" if r.get('success', False) else "❌"
@@ -389,30 +469,34 @@ def main(args: dict):
         if r.get('success', False):
             ttft = r.get('ttft_approx', 0.0)
             pure_time = r.get('pure_decode_time', 0.0)
-            steps = r.get('decode_steps', 0)
             tpot = r.get('tpot', 0.0) * 1000  # ms
             throughput = r.get('throughput', 0.0)
             
             print(f"{r['batch_size']:<8} "
+                  f"{r.get('matched_bucket', '-'):<8} "
+                  f"{r.get('padding_batch', 0):<6} "
+                  f"{r.get('padding_waste_pct', 0.0):<7.1f}% "
                   f"{r['seq_len']:<8} "
                   f"{ttft:<10.4f} "
                   f"{pure_time:<10.4f} "
-                  f"{steps:<8} "
-                  f"{tpot:<12.2f} "
-                  f"{throughput:<14.2f} "
+                  f"{tpot:<10.2f} "
+                  f"{throughput:<12.2f} "
                   f"{status:<8}")
         else:
             print(f"{r['batch_size']:<8} "
+                  f"{r.get('matched_bucket', '-'):<8} "
+                  f"{'-':<6} "
+                  f"{'-':<8} "
                   f"{r.get('seq_len', '-'):<8} "
-                  f"{'-':<10} {'-':<10} {'-':<8} {'-':<12} {'-':<14} "
+                  f"{'-':<10} {'-':<10} {'-':<10} {'-':<12} "
                   f"{status:<8}")
     
     # 保存结果到 JSON
     import json
-    output_file = "decode_benchmark_results.json"
+    output_file = "decode_benchmark_results_inplace_4b_1024_256.json"
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print(f"Results saved to {output_file}")
 
 
