@@ -289,6 +289,8 @@ class ForwardContext:
 
     stream_slot: Optional[StreamSlot] = None  # 新增字段
 
+    timing_scheme_label: Optional[str] = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode in [
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL], \
@@ -314,7 +316,8 @@ def create_forward_context(
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
         ubatch_slices: Optional[UBatchSlices] = None,
-        stream_slot: Optional[StreamSlot] = None) -> ForwardContext:
+        stream_slot: Optional[StreamSlot] = None,
+        timing_scheme_label: Optional[str] = None) -> ForwardContext:
     return ForwardContext(no_compile_layers=vllm_config.compilation_config.
                           static_forward_context,
                           virtual_engine=virtual_engine,
@@ -323,7 +326,8 @@ def create_forward_context(
                           cudagraph_runtime_mode=cudagraph_runtime_mode,
                           batch_descriptor=batch_descriptor,
                           ubatch_slices=ubatch_slices,
-                          stream_slot=stream_slot)
+                          stream_slot=stream_slot,
+                          timing_scheme_label=timing_scheme_label)
 
 
 @contextmanager
@@ -351,7 +355,8 @@ def set_forward_context(
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
         ubatch_slices: Optional[UBatchSlices] = None,
-        stream_slot: Optional[StreamSlot] = StreamSlot.PRIMARY):
+        stream_slot: Optional[StreamSlot] = StreamSlot.PRIMARY,
+        timing_scheme_label: Optional[str] = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -371,7 +376,9 @@ def set_forward_context(
     forward_context = create_forward_context(attn_metadata, vllm_config,
                                              virtual_engine, dp_metadata,
                                              cudagraph_runtime_mode,
-                                             batch_descriptor, ubatch_slices,stream_slot)
+                                             batch_descriptor, ubatch_slices,
+                                             stream_slot,
+                                             timing_scheme_label)
 
     try:
         with override_forward_context(forward_context):

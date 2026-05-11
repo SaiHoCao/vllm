@@ -9,6 +9,7 @@ from datasets import load_from_disk
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.utils import FlexibleArgumentParser
 
+# 用做差的方法测decode时间 不稳定
 
 def create_parser():
     parser = FlexibleArgumentParser()

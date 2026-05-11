@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, ReplayMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 
@@ -131,7 +131,12 @@ class CudagraphDispatcher:
         # This keeps the upfront key space small while still allowing users to
         # distinguish graphs by additional descriptor fields.
         capture_sizes = set(self.compilation_config.cudagraph_capture_sizes)
-        if batch_descriptor.num_tokens in capture_sizes:
+        # inplace 时,第二张图可以直接捕获重放
+        inplace_offset_graph = (
+            self.compilation_config.replay_mode == ReplayMode.DUAL_INPLACE
+            and batch_descriptor.start_num_tokens is not None
+            and batch_descriptor.start_num_tokens > 0)
+        if batch_descriptor.num_tokens in capture_sizes or inplace_offset_graph:
             # Prefer decode FULL graphs when requested and available.
             if batch_descriptor.uniform_decode and \
                 self.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL and \

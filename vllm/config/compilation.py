@@ -367,6 +367,12 @@ class CompilationConfig:
     - DUAL_MIXED: use dual stream replay and eager mixed execution for cudagraph execution.
     """
 
+    cudagraph_split_pad_threshold: int = 0
+    """Minimum number of padding tokens that dual-graph splitting must save.
+    A split is used only when the padding reduction is greater than this
+    threshold. The default 0 means split only when it actually reduces padding.
+    """
+
 
     # Attention ops; used for piecewise cudagraphs
     _attention_ops: ClassVar[list[str]] = [
@@ -455,6 +461,8 @@ class CompilationConfig:
         count_none = self.custom_ops.count("none")
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
+        assert self.cudagraph_split_pad_threshold >= -1, (
+            "cudagraph_split_pad_threshold must be at least -1")
 
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:

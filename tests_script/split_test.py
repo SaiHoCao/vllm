@@ -10,6 +10,7 @@ from datasets import load_from_disk
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.utils import FlexibleArgumentParser
 
+# 早期验证功能的测试
 
 def create_parser():
     parser = FlexibleArgumentParser()
@@ -19,15 +20,35 @@ def create_parser():
     # cudagraph_sizes = [1, 2, 4, 8, 16, 32] + [i * 64 for i in range(1, 9)] + [896] # [1,2,4,8,16,32,64,128,192,256,320,384,448,512]
     cudagraph_sizes = [1, 2, 4, 8, 16, 32, 64] + [i * 128 for i in range(1, 6)] + [896]
 
+    bucket_sizes = [1, 2, 4, 8, 16] + [i * 32 for i in range(1, 17)]
+    # [1,2,4,8,16,32,64,96,128,160,192,224,256,288,320,352,384,416,448,480,512]
+    # 21 张图
+    # 4b 1257ms 1507ms 1688ms
+    # 0.6b 1183ms 1190ms 1386ms
+
+    # dual_buffer = [1, 2, 4, 8, 16] + [i * 32 for i in range(1, 17)]
+    # [1,2,4,8,16,32,64,96,128,160,192,224,256,288,320,352,384,416,448,480,512]
+    # + [1,2,4,8,16,32]
+    # 27 张图
+    # 4b 1400ms 1369ms 1352ms
+    # 0.6b 1400ms 1368ms 1307ms
+
+    inplace = [1, 2, 4, 8, 16 ,32]  + [i * 64 for i in range(1, 9)]
+    # [1,2,4,8,16,32,64,128,192,256,320,384,448,512]
+    # 14张图
+    # 4b 1034ms 1049ms 1084ms
+    # 0.6b 987ms 921ms 1058ms
+
 
     compilation_config = {
         "level": "3",
+        # "cudagraph_mode": "NONE",
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
         # "replay_mode": "DUAL_MIXED",
         # "replay_mode": "DUAL_SERIAL",
-        # "replay_mode": "DUAL_PARALLEL", 
-        "replay_mode": "PADDING",
+        "replay_mode": "DUAL_PARALLEL", 
+        # "replay_mode": "PADDING",
         # "replay_mode": "DUAL_INPLACE",
 
     }
@@ -251,12 +272,12 @@ def main(args: dict):
     # batch_sizes = [bs for bs in batch_sizes if min_batch_size <= bs <= max_batch_size]
     # batch_sizes = sorted(set(batch_sizes))  # 去重并排序
 
-    batch_sizes = [600]  # 仅测试两个 batch size，快速验证功能
+    batch_sizes = [464]  # 仅测试两个 batch size，快速验证功能
     
     # 为每个 batch size 随机生成一个 seq_len
     for batch_size in batch_sizes:
         # seq_len = random.randint(min_seq_len, max_seq_len)
-        seq_len = 1024  # 固定 seq_len，快速验证功能
+        seq_len = 1000  # 固定 seq_len，快速验证功能
         test_configs.append((batch_size, seq_len))
     
     print(f"\n{'='*70}")

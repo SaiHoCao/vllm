@@ -168,10 +168,9 @@ class CUDAGraphWrapper:
             validate_cudagraph_capturing_enabled()
 
             input_addresses = [
-                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
+                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
-            input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
-                                    for _, v in kwargs.items()])
+            input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
             entry.input_addresses = input_addresses
             
             # 新增代码：记录 attn_metadata 地址
@@ -252,22 +251,21 @@ class CUDAGraphWrapper:
         if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
-                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
+                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             new_input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
-        
-        # new_input_addresses = []
-        # new_input_addresses.extend([x.data_ptr() for x in args if isinstance(x, torch.Tensor)])
-        # new_input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
-        new_input_addresses = [
-                x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
-            ]
-        new_input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
-                                    for _, v in kwargs.items()])
+
+        new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+        new_input_addresses.extend([v.data_ptr() for k, v in kwargs.items() if isinstance(v, torch.Tensor)])
+        # new_input_addresses = [
+        #         x.data_ptr() if isinstance(x, torch.Tensor) else id(x) for x in args
+        #     ]
+        # new_input_addresses.extend([v.data_ptr() if isinstance(v, torch.Tensor) else id(v) 
+        #                             for _, v in kwargs.items()])
         assert new_input_addresses == entry.input_addresses, (
             f"Input addresses for cudagraphs are different "
             f"during replay. Expected {entry.input_addresses}, "
@@ -332,7 +330,7 @@ class CUDAGraphWrapper:
                         f"Attn_metadata addresses are different during replay. "
                         f"Captured: {entry.attn_metadata_addresses}, "
                         f"Current: {current_attn_addrs}")
-        print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
+        # print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
         if stream_slot == StreamSlot.PRIMARY:
             nvtx.range_push(f"CUDAGraph Replay Primary num_tokens: {batch_descriptor.num_tokens}")
             entry.cudagraph.replay()
