@@ -353,7 +353,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.vllm_config.model_config.logits_processors),
             is_pooling_model=self.is_pooling_model,
         )
-        if self.compilation_config.replay_mode in (ReplayMode.DUAL_SERIAL, ReplayMode.DUAL_PARALLEL):
+        if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
+            # DUAL_PARALLEL需要第二个Buffer 相关
             self.micro_input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 # We need to use the encoder length for encoder-decoer
@@ -461,7 +462,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # 定义micro graph 相关的buffer
         # micro_batch_size的大小 最大的档位差
         self.micro_batch_size = self._get_micro_batch_size()
-        if self.compilation_config.replay_mode in (ReplayMode.DUAL_SERIAL, ReplayMode.DUAL_PARALLEL):
+        if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
+            # DUAL_PARALLEL需要第二个buffer相关
             # 1.输入相关的buffer
             self.micro_input_ids = self._make_buffer(self.micro_batch_size,
                                                dtype=torch.int32)
@@ -2646,8 +2648,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens = (ubatch_slices[0].num_tokens +
                                 ubatch_slices[1].num_tokens)
             num_tokens_after_padding = None
-        elif self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL): # 双图Repaly 模式下
-            # 双图模式下，输入token数等于 第一部分图的token数 + 第二部分图的token数(第二部分要padding)
+        elif self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL: 
+            # DUAL_PARALLEL 输入token数等于 第一部分图的token数 + 第二部分图的token数(第二部分要padding)
             num_input_tokens = ubatch_slices[0].num_tokens + \
                 self._get_num_input_tokens(ubatch_slices[1].num_tokens)
 
@@ -2657,7 +2659,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # 把第二部分的ubatch slice padding到 num_input_tokens
             self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
         else:
-            # Replay + eager Mixed 模式下
+            # PADIING Replay + eager Mixed 模式下
             num_input_tokens = num_scheduled_tokens
 
         # _prepare_inputs may reorder the batch, so we must gather multi
@@ -3072,7 +3074,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ubatch_slices[1].token_slice, input_ids, positions,
                     inputs_embeds, intermediate_tensors)
 
-        if replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL):
+        if replay_mode == ReplayMode.DUAL_PARALLEL:
+            # DUAL_PARALLEL 要把第二部分输入放在micro_micro_buffer
             second_input_ids, second_positions, second_inputs_embeds, \
                 second_intermediate_tensors = \
                     self._copy_second_ubatch_to_micro_buffers(
@@ -3344,7 +3347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 execute_timing_events[1].record(torch.cuda.current_stream())
             nvtx.range_pop()
         elif self.compilation_config.replay_mode in (
-                ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL,
+                ReplayMode.DUAL_PARALLEL,
                 ReplayMode.DUAL_MIXED, ReplayMode.DUAL_INPLACE):
             
             nvtx.range_push(
@@ -4661,7 +4664,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
 
                 compilation_cases = list(reversed(self.cudagraph_batch_sizes))
-                if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL):
+                if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
+                    # DUAL_PARALLEL需要在两个buffer上捕获两组图
                     self._capture_cudagraphs_dual(
                         compilation_cases,
                         cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -4685,7 +4689,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 compilation_cases_decode = list(
                     reversed(decode_cudagraph_batch_sizes))
                 
-                if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_SERIAL):
+                if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL:
+                    # DUAL_PARALLEL需要在两个buffer上捕获两组图
                     self._capture_cudagraphs_dual(
                         compilation_cases=compilation_cases_decode,
                         cudagraph_runtime_mode=CUDAGraphMode.FULL,

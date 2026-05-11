@@ -46,7 +46,6 @@ def create_parser():
         "cudagraph_mode": "FULL_DECODE_ONLY",
         "cudagraph_capture_sizes": cudagraph_sizes,
         # "replay_mode": "DUAL_MIXED",
-        # "replay_mode": "DUAL_SERIAL",
         "replay_mode": "DUAL_PARALLEL", 
         # "replay_mode": "PADDING",
         # "replay_mode": "DUAL_INPLACE",

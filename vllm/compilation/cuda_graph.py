@@ -103,7 +103,7 @@ class CUDAGraphWrapper:
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry]\
                                                                         = {}
         
-        self.graph_pool_secondary = current_platform.graph_pool_handle() if self.compilation_config.replay_mode in (ReplayMode.DUAL_PARALLEL,ReplayMode.DUAL_SERIAL) else None
+        self.graph_pool_secondary = current_platform.graph_pool_handle() if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL else None
         self.concrete_cudagraph_entries_secondary: dict[
                 BatchDescriptor, CUDAGraphEntry] = {} 
 

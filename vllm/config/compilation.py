@@ -68,10 +68,9 @@ class ReplayMode(enum.Enum):
     """ Constants for the replay mode in CompilationConfig.
     """
     PADDING = 0
-    DUAL_SERIAL = 1
-    DUAL_PARALLEL = 2
-    DUAL_MIXED = 3
-    DUAL_INPLACE = 4
+    DUAL_PARALLEL = 1
+    DUAL_MIXED = 2
+    DUAL_INPLACE = 3
 
 
 @config
@@ -362,7 +361,6 @@ class CompilationConfig:
     replay_mode: Optional[ReplayMode] = None
     """The replay mode for dual graph cudagraph execution:
     - PADDING: use padding to the max batch size for cudagraph execution.
-    - DUAL_SERIAL: use dual stream serial execution for cudagraph execution.
     - DUAL_PARALLEL: use dual stream parallel execution for cudagraph execution.
     - DUAL_MIXED: use dual stream replay and eager mixed execution for cudagraph execution.
     """

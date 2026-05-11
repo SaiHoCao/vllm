@@ -208,7 +208,6 @@ def plot_summary(points: list[dict[str, Any]], output_dir: Path, stat: str,
         "PADDING": "#F58518",
         "DUAL_PARALLEL": "#54A24B",
         "DUAL_INPLACE": "#B279A2",
-        "DUAL_SERIAL": "#E45756",
         "DUAL_MIXED": "#72B7B2",
     }
     markers = {
@@ -216,7 +215,6 @@ def plot_summary(points: list[dict[str, Any]], output_dir: Path, stat: str,
         "PADDING": "s",
         "DUAL_PARALLEL": "^",
         "DUAL_INPLACE": "D",
-        "DUAL_SERIAL": "P",
         "DUAL_MIXED": "X",
     }
 
